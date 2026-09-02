@@ -834,7 +834,13 @@ def solve(
         scenario_seed=scenario.seed,
         diagnostics={
             **diagnostics,
-            "served_count": len(customers) - len(unserved),
+            # 実際に立ち寄った軒数。**引き算で出してはいけない。**
+            # len(customers) - len(unserved) と書いていたが、unserved は
+            # 需要のある需要家しか含まないので、満タンで行く必要のない軒が
+            # 「回った」側に混ざる。本番で立ち寄り9軒の計画が
+            # served_count=10 と申告していた。
+            "served_count": sum(len(t.stops) for vd in vehicle_days for t in vd.trips),
+            "no_demand_count": sum(1 for c in customers if c.demand_l <= 0),
             "trip_count": sum(len(vd.trips) for vd in vehicle_days),
             "tiebreak": solver.Value(tiebreak),
             "phase1_status": phase1_status,

@@ -260,3 +260,22 @@ def test_objective_stays_in_range():
         # 必須訪問を落としていないなら、目的値は罰1件ぶんより小さいはず
         if not plan.mandatory_missed:
             assert plan.objective < 100_000
+
+
+def test_served_count_matches_actual_stops():
+    """診断の「回れた軒数」が、実際の立ち寄り数と一致する。
+
+    引き算（全需要家 − 回れなかった需要家）で出していたとき、満タンで
+    行く必要のない軒が「回った」側に混ざり、本番で立ち寄り9軒の計画が
+    served_count=10 と申告していた。数字が1つでもずれると、
+    「今日は何軒回れたのか」という一番基本的な問いに答えられなくなる。
+    """
+    scenario, _, plan = _plan()
+    actual = sum(len(t.stops) for t in plan.trips)
+    assert plan.diagnostics["served_count"] == actual
+
+    # 回った軒 ＋ 回れなかった軒 ＋ 需要ゼロの軒 ＝ 全需要家
+    assert (
+        actual + len(plan.unserved) + plan.diagnostics["no_demand_count"]
+        == len(scenario.customers)
+    )
