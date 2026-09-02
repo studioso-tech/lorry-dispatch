@@ -15,6 +15,8 @@
 
 from __future__ import annotations
 
+from functools import lru_cache
+
 import pytest
 
 from core.generator import generate
@@ -30,8 +32,15 @@ SEEDS = (20261015, 42)
 TEST_TIME_LIMIT_S = 25.0
 
 
-def _plan(seed: int = 20261015, season: str = "winter", **kw):
-    s = generate(seed=seed, season=season, **kw)
+@lru_cache(maxsize=None)
+def _plan(seed: int = 20261015, season: str = "winter", absent_drivers: tuple = ()):
+    """同じ条件は1度しか解かない。
+
+    テストごとに解き直していたとき、同じ問題を8回解いていてテスト全体が
+    10分を超えた。求解は入力が同じなら結果も同じ（それがこのコアの性質）
+    なので、使い回して差し支えない。
+    """
+    s = generate(seed=seed, season=season, absent_drivers=absent_drivers)
     m = build_matrix(s.depot, s.customers)
     return s, m, solve(s, matrix=m, time_limit_s=TEST_TIME_LIMIT_S)
 
@@ -279,3 +288,42 @@ def test_served_count_matches_actual_stops():
         actual + len(plan.unserved) + plan.diagnostics["no_demand_count"]
         == len(scenario.customers)
     )
+
+
+def test_reproducible_flag_never_lies():
+    """`reproducible` が真なら、両段とも最適性を証明できている。
+
+    2段目を決定的時間で打ち切って最適性の証明を省く案を試したとき、
+    この条件を緩めた。結果、**計画が違うのに reproducible が真を返す**
+    という最悪の形になった（5件中3件）。フラグが嘘をつくくらいなら、
+    遅いほうがましである。
+
+    構造として守るべきなのは「真を返すなら根拠がある」ことなので、
+    診断の中身どうしの整合をここで固定する。
+    """
+    for max_trips in (1, 2):
+        s = generate(seed=777, season="winter")
+        m = build_matrix(s.depot, s.customers)
+        plan = solve(s, matrix=m, time_limit_s=TEST_TIME_LIMIT_S, max_trips=max_trips)
+        d = plan.diagnostics
+        if d["reproducible"]:
+            assert d["phase1_status"] == "OPTIMAL", d
+            assert d["phase2_status"] == "OPTIMAL", d
+
+
+def test_skipping_the_tiebreak_phase_keeps_the_cost():
+    """2段目を省いても、コストと実行可能性は変わらない。
+
+    体制設計の掃引は「何台で回るか」しか要らないので、2段目を丸ごと
+    省いて時間を稼ぐ。省いた計画は再現性を持たないので、その旨が
+    診断に出ていることも確かめる。
+    """
+    s = generate(seed=99, season="winter")
+    m = build_matrix(s.depot, s.customers)
+    full = solve(s, matrix=m, time_limit_s=TEST_TIME_LIMIT_S)
+    quick = solve(s, matrix=m, time_limit_s=TEST_TIME_LIMIT_S, tiebreak_phase=False)
+
+    if full.diagnostics["phase1_status"] == "OPTIMAL" and quick.diagnostics["phase1_status"] == "OPTIMAL":
+        assert full.objective == quick.objective
+    assert quick.diagnostics["phase2_status"] == "skipped"
+    assert quick.diagnostics["reproducible"] is False
