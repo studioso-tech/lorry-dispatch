@@ -112,9 +112,15 @@ def _memory_day(day: str) -> dict[str, Any]:
 
 
 def _day_ref(day: str):
-    from app.firestore_client import get_client
+    """その日の台帳ドキュメント。
 
-    return get_client().collection("ledger").document(day)
+    コレクション名は firestore_client.collection() を通す。相乗り先の
+    Wayfinder が同じ "(default)" データベースの `ledger/{day}` を使っており、
+    接頭辞なしで書くと互いの台帳を上書きし合う。
+    """
+    from app.firestore_client import collection, get_client
+
+    return get_client().collection(collection("ledger")).document(day)
 
 
 def backend() -> str:

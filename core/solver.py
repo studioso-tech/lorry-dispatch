@@ -1,4 +1,4 @@
-"""決定論コア: 単槽 CVRPTW ＋ 乗務員拘束時間（v0）。
+"""決定論コア: 複数便 CVRPTW ＋ 乗務員拘束時間。
 
 この層の役割:
     **数字を出すのはここだけ。**エージェント層（W4）は「何を計算させるか」
@@ -6,19 +6,23 @@
     到着時刻も一切計算しない。散文と数字が食い違う事故は、モデルに算術を
     させたときにしか起きない。
 
-v0 の範囲（M1a）:
+いま解けること:
     - 容量制約つき配送計画（CVRP）
     - 需要家の受入時間枠（TW）
     - 乗務員の拘束時間・運転時間・連続運転の休憩（改善基準告示）
     - 発注点割れの需要家は必須訪問、それ以外は任意（切迫度で重み付け）
+    - **1台が1日に複数便を回る**（油槽所へ戻って積み直す）
 
-v0 に**まだ無いもの**（意図的に外してある）:
-    - 多コンパートメント割当（槽ごとに単一油種）        → W2 / M1b
-    - 油槽所の積込回数・回転（1台1日1便に固定）        → W2 / M1b
-    - 有向の時間帯係数、高速 vs 一般道、p80 で解く      → W3 / M2
-    ここで単槽に落としてあるのは手抜きではなく、W2 で多槽に上げたときに
-    「多槽にしたせいで解けなくなった」のか「元から解けていなかった」のかを
-    切り分けられるようにするため。単槽の解が基準線になる。
+複数便を入れた理由:
+    1台1日1便に固定していたとき、全車が午前中に帰庫して以降ずっと空くのに、
+    必須需要 88.8kL に対し車両総容量 70.0kL で切迫した需要家が2軒残っていた。
+    実際の二次配送は1台が日に2〜4便回るので、これは制約ではなくモデルの
+    欠落だった。乗務員の拘束時間が本当に効いてくるのもここから先である。
+
+まだ無いもの（意図的に外してある）:
+    - 多コンパートメント割当（槽ごとに単一油種）        → M1b の残り
+    - 油槽所の積込回数・回転の上限                      → M1b の残り
+    - 有向の時間帯係数、高速 vs 一般道、p80 で解く      → M2
 
 なぜ CP-SAT か:
     時間枠・容量・拘束時間・必須訪問が混ざった問題で、しかも
@@ -26,6 +30,12 @@ v0 に**まだ無いもの**（意図的に外してある）:
     経路を素直に書け、目的関数に説明可能な項（未訪問のペナルティ、
     車両の固定費）を並べられる。ルーティング専用ソルバーより、
     後から制約を1本足すのが安い。
+
+モデルの組み方:
+    1台の1日を「便」に分け、**便を単位に circuit を1つずつ張る**。
+    便は (車, 便番号) の組で、それぞれが油槽所を出て油槽所へ帰る輪になる。
+    同じ車の便は時間順に並び、前の便が帰ってから積込時間ぶん空けて次が出る。
+    拘束時間と運転時間は便ではなく**車ごと**に合算して上限を見る。
 """
 
 from __future__ import annotations
@@ -35,7 +45,7 @@ from dataclasses import dataclass, field
 
 from ortools.sat.python import cp_model
 
-from core.domain import Customer, Scenario, minutes_to_hhmm
+from core.domain import Customer, Scenario, Vehicle, minutes_to_hhmm
 from core.travel import TravelMatrix, build_matrix
 
 # ---------------------------------------------------------------------------
@@ -74,26 +84,23 @@ VEHICLE_FIXED_COST_MIN = 90
 #: かかるので、走行1分のほうが拘束1分より重い（走行は両方に計上される）。
 DUTY_COST_PER_MIN = 1
 
-#: 主目的をこの倍率で持ち上げ、下位の桁をタイブレークに使う。
+#: 1台が1日に回れる便の上限。
 #:
-#: **なぜ必要か。** 同点の最適解が複数あるとき、CP-SAT の並列探索は
-#: そのうちどれを返すかを保証しない。目的値は毎回同じなのに、どの車が
-#: どの需要家を回るかが実行のたびに変わる。実際に、同じ要求を2回投げると
-#: 別の割当が返ってきた。
+#: 既定を2にしてあるのは実測による。5通りの seed を60秒で解いたとき:
 #:
-#: これは審査上そのまま問題になる。提出要件は「審査員が動かせる状態」であり、
-#: 手元で再現できない計画は説明の裏づけにならない。LM-as-Judge の回帰テスト
-#: （W6）も、計画が毎回変わるなら品質の劣化を検出できない。
+#:   上限1便: 5/5 で最適性を証明（0.8〜4.8秒）。ただし回れるのが7〜8軒で、
+#:            切れかけの需要家が1〜4軒残る。1台1日1便は現場の姿でもない。
+#:   上限2便: 4/5 で最適性を証明（21〜56秒）。8〜12軒回れて、残るのは1〜2軒。
+#:   上限3便: 60秒では1つも証明できない。計画自体は2便とほぼ同等。
 #:
-#: 対策として、ワーカー数を1に落とす案は捨てた。単一ワーカーでは
-#: seed=20261015 が60秒かけても最適性を証明できず、時間切れによる
-#: 別種の非決定性を招く。代わりに**最適解を一意に近づける**。
-#:
-#: CP-SAT の interleave_search=True でも決定性は得られた（10 seed × 3回で
-#: 完全一致）が、求解が 0.3〜8秒から 7〜20秒に鈍る。タイブレークで
-#: 同じ決定性が得られたので採らなかった。目的関数側で閉じるほうが、
-#: なぜその解が選ばれたかを説明できる点でも優る。
-OBJECTIVE_SCALE = 1_000_000
+#: 3便まで許すと、探索が広がったぶんを取り返せていない。上限を上げる前に
+#: モデル側の高速化（油槽所の複製による1車1周回化、初期解のヒント）が要る。
+#: これは W2 の課題として残っている。
+MAX_TRIPS_PER_VEHICLE = 2
+
+#: 既定の求解時間。複数便にしてから1便固定のころの数秒では足りない。
+#: 上限2便で最適性を証明できる水準に合わせてある。
+DEFAULT_TIME_LIMIT_S = 60.0
 
 
 @dataclass(frozen=True)
@@ -110,37 +117,72 @@ class Stop:
 
     @property
     def slack_min(self) -> int:
-        """締切までの余裕。ここが薄い立ち寄りが、W3 で p95 警告の対象になる。"""
+        """締切までの余裕。ここが薄い立ち寄りが、M2 で p95 警告の対象になる。"""
         return self.window_close_min - self.arrive_min
 
 
 @dataclass(frozen=True)
-class Route:
-    """ローリー1台ぶんの1日。"""
+class Trip:
+    """1便。油槽所を出て、何軒か回って、油槽所へ帰るまで。"""
+
+    vehicle_id: str
+    vehicle_name: str
+    trip_index: int          # 0 が1便目
+    load_start_min: int      # 積込開始
+    depart_min: int          # 油槽所を出る時刻
+    return_min: int          # 油槽所に戻る時刻
+    drive_min: int           # この便の運転時間
+    load_l: int              # この便で積んだ量
+    capacity_l: int
+    stops: tuple[Stop, ...]
+
+    @property
+    def service_min(self) -> int:
+        """この便の荷卸時間の合計。"""
+        return sum(s.depart_min - s.arrive_min for s in self.stops)
+
+    @property
+    def elapsed_min(self) -> int:
+        """積込開始から帰庫まで。1便の長さ。"""
+        return self.return_min - self.load_start_min
+
+    @property
+    def utilization(self) -> float:
+        """この便の積載率。"""
+        return self.load_l / self.capacity_l if self.capacity_l else 0.0
+
+
+@dataclass(frozen=True)
+class VehicleDay:
+    """1台の1日。便をまとめて、拘束時間と運転時間をここで見る。
+
+    上限は便ではなく人にかかる。1便ずつ見ていると、3便で拘束15時間の
+    計画が「どの便も短いから大丈夫」に見えてしまう。
+    """
 
     vehicle_id: str
     vehicle_name: str
     driver_id: str
     driver_name: str
-    load_start_min: int      # 積込開始＝拘束の始まり
-    depart_min: int          # 油槽所を出る時刻
-    return_min: int          # 油槽所に戻る時刻＝拘束の終わり
-    drive_min: int           # 運転時間の合計
-    service_min: int         # 荷卸時間の合計
+    duty_start_min: int      # 最初の便の積込開始＝拘束の始まり
+    duty_end_min: int        # 最後の便の帰庫＝拘束の終わり
+    drive_min: int           # 1日の運転時間の合計
     break_min: int           # 連続運転の上限で要る休憩
-    load_l: int              # 積んだ量
-    capacity_l: int
-    stops: tuple[Stop, ...]
+    trips: tuple[Trip, ...]
 
     @property
     def duty_min(self) -> int:
-        """拘束時間。積込開始から帰着まで。"""
-        return self.return_min - self.load_start_min
+        """1日の拘束時間。"""
+        return self.duty_end_min - self.duty_start_min
 
     @property
-    def utilization(self) -> float:
-        """積載率。低い便が並ぶなら台数を減らせる余地がある。"""
-        return self.load_l / self.capacity_l if self.capacity_l else 0.0
+    def load_l(self) -> int:
+        """1日に運んだ量の合計。"""
+        return sum(t.load_l for t in self.trips)
+
+    @property
+    def stop_count(self) -> int:
+        return sum(len(t.stops) for t in self.trips)
 
 
 @dataclass(frozen=True)
@@ -164,7 +206,7 @@ class Plan:
     """求解の結果一式。エージェント層と画面はこれしか見ない。"""
 
     status: str                      # OPTIMAL / FEASIBLE / INFEASIBLE / UNKNOWN
-    routes: tuple[Route, ...]
+    vehicle_days: tuple[VehicleDay, ...]
     unserved: tuple[Unserved, ...]
     total_drive_min: int
     objective: int
@@ -172,6 +214,11 @@ class Plan:
     scenario_date: str
     scenario_seed: int
     diagnostics: dict[str, object] = field(default_factory=dict)
+
+    @property
+    def trips(self) -> tuple[Trip, ...]:
+        """全便を平らに並べたもの。"""
+        return tuple(t for vd in self.vehicle_days for t in vd.trips)
 
     @property
     def is_usable(self) -> bool:
@@ -187,11 +234,12 @@ class Plan:
         """配車係の言葉での1行要約。OR の用語は出さない。"""
         if not self.is_usable:
             return "今日の配車を組めませんでした。制約を見直してください。"
-        vehicles = len(self.routes)
-        stops = sum(len(r.stops) for r in self.routes)
+        vehicles = len(self.vehicle_days)
+        trips = len(self.trips)
+        stops = sum(vd.stop_count for vd in self.vehicle_days)
         missed = len(self.mandatory_missed)
         head = (
-            f"{vehicles}台で{stops}軒。走行は合計"
+            f"{vehicles}台・{trips}便で{stops}軒。走行は合計"
             f"{self.total_drive_min // 60}時間{self.total_drive_min % 60}分。"
         )
         if missed:
@@ -215,12 +263,21 @@ def _optional_penalty(customer: Customer) -> int:
     return PENALTY_OPTIONAL_BASE_MIN + int(round(urgency * PENALTY_URGENCY_PER_DAY_MIN))
 
 
+def _all_unserved(customers) -> tuple[Unserved, ...]:
+    return tuple(
+        Unserved(c.id, c.name, c.demand_l, c.is_mandatory, c.min_days_to_empty())
+        for c in customers
+        if c.demand_l > 0
+    )
+
+
 def solve(
     scenario: Scenario,
     *,
     matrix: TravelMatrix | None = None,
-    time_limit_s: float = 30.0,
+    time_limit_s: float = DEFAULT_TIME_LIMIT_S,
     workers: int = 8,
+    max_trips: int = MAX_TRIPS_PER_VEHICLE,
     log: bool = False,
 ) -> Plan:
     """1日ぶんの配車を解く。
@@ -228,9 +285,10 @@ def solve(
     Args:
         scenario: 生成器またはエージェント層が用意した当日の問題。
         matrix: 所要時間行列。省略時は幾何モデル（v0）で組む。
-            W2 で実測のスナップショットを渡すようになるが、ここは変えない。
-        time_limit_s: 求解の打ち切り。デモの応答性のために既定30秒。
+            M2 で実測のスナップショットを渡すようになるが、ここは変えない。
+        time_limit_s: 求解の打ち切り。既定60秒（複数便の最適性証明に要る）。
         workers: 並列探索数。Cloud Run の vCPU に合わせる。
+        max_trips: 1台が1日に回れる便の上限。
         log: CP-SAT の探索ログを出すか。障害調査用。
 
     Returns:
@@ -240,7 +298,7 @@ def solve(
     """
     depot = scenario.depot
     customers = scenario.customers
-    vehicles = scenario.usable_vehicles()
+    fleet: tuple[Vehicle, ...] = scenario.usable_vehicles()
     matrix = matrix or build_matrix(depot, customers)
 
     n = len(customers) + 1          # 0 = 油槽所
@@ -249,80 +307,120 @@ def solve(
 
     diagnostics: dict[str, object] = {
         "fleet_capacity_l": scenario.fleet_capacity_l,
+        "fleet_capacity_with_trips_l": scenario.fleet_capacity_l * max_trips,
         "mandatory_demand_l": scenario.mandatory_demand_l,
         "total_demand_l": sum(c.demand_l for c in customers),
         "mandatory_count": sum(1 for c in customers if c.is_mandatory),
-        "usable_vehicles": [v.id for v in vehicles],
+        "usable_vehicles": [v.id for v in fleet],
         "absent_drivers": [d.id for d in scenario.drivers if not d.available],
+        "max_trips_per_vehicle": max_trips,
     }
 
-    if not vehicles:
+    if not fleet:
         # 車が1台も出せない。解こうとするだけ無駄なので、理由をつけて返す。
         return Plan(
             status="INFEASIBLE",
-            routes=(),
-            unserved=tuple(
-                Unserved(c.id, c.name, c.demand_l, c.is_mandatory, c.min_days_to_empty())
-                for c in customers
-                if c.demand_l > 0
-            ),
+            vehicle_days=(),
+            unserved=_all_unserved(customers),
             total_drive_min=0,
             objective=0,
             wall_time_s=0.0,
             scenario_date=scenario.date,
             scenario_seed=scenario.seed,
-            diagnostics={**diagnostics, "reason": "出せるローリーが無い（乗務員欠勤または資格不足）"},
+            diagnostics={
+                **diagnostics,
+                "reason": "出せるローリーが無い（乗務員欠勤または資格不足）",
+            },
         )
 
     model = cp_model.CpModel()
-    K = len(vehicles)
+
+    # 「便」を単位にする。u は (車の添字, 便番号) の組に1対1で対応する。
+    units: list[tuple[int, int]] = [
+        (v_idx, trip)
+        for v_idx in range(len(fleet))
+        for trip in range(max_trips)
+    ]
+    U = len(units)
+    unit_of: dict[tuple[int, int], int] = {vt: u for u, vt in enumerate(units)}
 
     # --- 変数 --------------------------------------------------------------
-    # visit[k][i]: 車 k が節点 i を訪れる（i=0 は油槽所＝その車を使う）
-    visit = [[model.NewBoolVar(f"visit_k{k}_n{i}") for i in range(n)] for k in range(K)]
-    used = [visit[k][0] for k in range(K)]
+    # visit[u][i]: 便 u が節点 i を訪れる（i=0 は油槽所＝その便を出す）
+    visit = [[model.NewBoolVar(f"visit_u{u}_n{i}") for i in range(n)] for u in range(U)]
+    used = [visit[u][0] for u in range(U)]
 
-    # x[k][(i,j)]: 車 k が i→j を走る
-    x: list[dict[tuple[int, int], cp_model.IntVar]] = [{} for _ in range(K)]
+    # x[u][(i,j)]: 便 u が i→j を走る
+    x: list[dict[tuple[int, int], cp_model.IntVar]] = [{} for _ in range(U)]
 
-    # 時刻。t[k][i] は「車 k が節点 i に着く時刻」。
-    # 車ごとに持つのは、同じ需要家を別の車が別の時刻に訪れる可能性を
+    # 時刻。t[u][i] は「便 u が節点 i に着く時刻」。
+    # 便ごとに持つのは、同じ需要家を別の便が別の時刻に訪れる可能性を
     # 型の上で許してしまわないため（訪問は1回に制約するが、時間の整合を
-    # 車をまたいで共有すると、未訪問の車の時刻変数が経路を歪める）。
+    # 便をまたいで共有すると、未訪問の便の時刻変数が経路を歪める）。
     t = [
         [
             model.NewIntVar(
                 depot.open_min if i == 0 else customers[i - 1].window_open_min,
                 horizon if i == 0 else customers[i - 1].window_close_min,
-                f"t_k{k}_n{i}",
+                f"t_u{u}_n{i}",
             )
             for i in range(n)
         ]
-        for k in range(K)
+        for u in range(U)
     ]
     depart = [
-        model.NewIntVar(depot.open_min + depot.load_min, horizon, f"depart_k{k}")
-        for k in range(K)
+        model.NewIntVar(depot.open_min + depot.load_min, horizon, f"depart_u{u}")
+        for u in range(U)
     ]
-    ret = [model.NewIntVar(depot.open_min, horizon, f"return_k{k}") for k in range(K)]
+    ret = [model.NewIntVar(depot.open_min, horizon, f"return_u{u}") for u in range(U)]
 
     # --- 経路（AddCircuit） -------------------------------------------------
     #
     # 自己ループのリテラルに visit の否定を置くと、
     # 「訪れない節点は circuit から外れる」が素直に書ける。
     # 全節点が自己ループなら空の circuit として成立するので、
-    # 使わない車もそのまま表現できる。
-    for k in range(K):
+    # 出さない便もそのまま表現できる。
+    # 到達できない区間は最初から作らない。
+    #
+    # i を受入開始と同時に着いて荷卸し、そのまま j へ向かっても j の締切に
+    # 間に合わないなら、その区間は解の中に現れ得ない。変数として置いておくと
+    # 探索空間だけが広がる。複数便にしてモデルが3倍になったぶん、ここの
+    # 効きが大きい（枝刈り前は120秒でも最適性を証明できなかった）。
+    def _reachable(i: int, j: int) -> bool:
+        if i == j:
+            return False
+        if j == 0:                       # 帰庫はいつでもできる
+            return True
+        latest_j = customers[j - 1].window_close_min
+        if i == 0:
+            earliest = depot.open_min + depot.load_min + travel[0][j]
+        else:
+            earliest = (
+                customers[i - 1].window_open_min
+                + customers[i - 1].service_min
+                + travel[i][j]
+            )
+        return earliest <= latest_j
+
+    pruned = 0
+    for u, (v_idx, _) in enumerate(units):
+        cap = fleet[v_idx].capacity_l
         arcs: list[tuple[int, int, cp_model.IntVar]] = []
         for i in range(n):
-            arcs.append((i, i, visit[k][i].Not()))
+            # 積載量を超える需要家には、その車では行けない
+            if i > 0 and customers[i - 1].demand_l > cap:
+                model.Add(visit[u][i] == 0)
+            arcs.append((i, i, visit[u][i].Not()))
             for j in range(n):
                 if i == j:
                     continue
-                lit = model.NewBoolVar(f"x_k{k}_{i}_{j}")
-                x[k][(i, j)] = lit
+                if not _reachable(i, j):
+                    pruned += 1
+                    continue
+                lit = model.NewBoolVar(f"x_u{u}_{i}_{j}")
+                x[u][(i, j)] = lit
                 arcs.append((i, j, lit))
         model.AddCircuit(arcs)
+    diagnostics["pruned_arcs"] = pruned
 
     # --- 訪問の一意性 ------------------------------------------------------
     #
@@ -333,83 +431,172 @@ def solve(
     for idx, c in enumerate(customers, start=1):
         s = model.NewBoolVar(f"served_{c.id}")
         served.append(s)
-        model.Add(sum(visit[k][idx] for k in range(K)) == s)
+        model.Add(sum(visit[u][idx] for u in range(U)) == s)
         if c.demand_l <= 0:
             # 満タンの需要家に行く意味はない。回れるのに回らない、を明示する。
             model.Add(s == 0)
 
-    # --- 容量 --------------------------------------------------------------
-    load = []
-    for k, v in enumerate(vehicles):
-        l = model.NewIntVar(0, v.capacity_l, f"load_k{k}")
-        model.Add(
-            l == sum(customers[i - 1].demand_l * visit[k][i] for i in range(1, n))
+    # --- 同型の車の対称性を潰す --------------------------------------------
+    #
+    # 1号車と2号車、3号車と4号車は槽構成も乗務員の上限も同じで完全に対称。
+    # 何もしないと、同じ計画が車の入れ替えだけで何通りにも表現でき、探索が
+    # そのぶん無駄に広がる。複数便にしてからは、これが最適性の証明を
+    # 妨げるほど効いていた。
+    #
+    # 入れ方は「若い番号の車が、若い番号の需要家を先に取る」。
+    # 同型の車 v と v+1 について、v+1 が需要家 i を持つなら、v は i より
+    # 若い需要家を必ず1軒は持っている。どんな解も車を並べ替えれば必ず
+    # この形にできるので、最適解を切り落とさない。
+    veh_visit = [
+        [model.NewBoolVar(f"vv_v{v_idx}_n{i}") for i in range(n)]
+        for v_idx in range(len(fleet))
+    ]
+    for v_idx in range(len(fleet)):
+        my_units = [unit_of[(v_idx, trip)] for trip in range(max_trips)]
+        for i in range(1, n):
+            model.Add(veh_visit[v_idx][i] == sum(visit[u][i] for u in my_units))
+
+    def _same_kind(a: Vehicle, b: Vehicle) -> bool:
+        """槽構成も乗務員の上限も同じか。同じなら入れ替えても計画は変わらない。"""
+        da, db = scenario.driver(a.driver_id), scenario.driver(b.driver_id)
+        return (
+            sorted(a.compartments_l) == sorted(b.compartments_l)
+            and (da.max_duty_min, da.max_drive_min) == (db.max_duty_min, db.max_drive_min)
+            and da.available == db.available
         )
+
+    symmetric_pairs = 0
+    for v_idx in range(len(fleet) - 1):
+        if not _same_kind(fleet[v_idx], fleet[v_idx + 1]):
+            continue
+        symmetric_pairs += 1
+        for i in range(1, n):
+            model.AddBoolOr(
+                [veh_visit[v_idx][j] for j in range(1, i)]
+                + [veh_visit[v_idx + 1][i].Not()]
+            )
+    diagnostics["symmetric_vehicle_pairs"] = symmetric_pairs
+
+    # --- 容量（便ごとに積み直す） ------------------------------------------
+    load = []
+    for u, (v_idx, _) in enumerate(units):
+        cap = fleet[v_idx].capacity_l
+        l = model.NewIntVar(0, cap, f"load_u{u}")
+        model.Add(l == sum(customers[i - 1].demand_l * visit[u][i] for i in range(1, n)))
         load.append(l)
 
     # --- 時間の連鎖 --------------------------------------------------------
-    for k in range(K):
-        for (i, j), lit in x[k].items():
+    for u in range(U):
+        for (i, j), lit in x[u].items():
             if i == 0:
                 # 油槽所を出て最初の1軒へ
-                model.Add(t[k][j] >= depart[k] + travel[0][j]).OnlyEnforceIf(lit)
+                model.Add(t[u][j] >= depart[u] + travel[0][j]).OnlyEnforceIf(lit)
             elif j == 0:
                 # 最後の1軒から帰着
                 model.Add(
-                    ret[k] >= t[k][i] + customers[i - 1].service_min + travel[i][0]
+                    ret[u] >= t[u][i] + customers[i - 1].service_min + travel[i][0]
                 ).OnlyEnforceIf(lit)
             else:
                 model.Add(
-                    t[k][j] >= t[k][i] + customers[i - 1].service_min + travel[i][j]
+                    t[u][j] >= t[u][i] + customers[i - 1].service_min + travel[i][j]
                 ).OnlyEnforceIf(lit)
 
-    # --- 乗務員の拘束時間・運転時間 ----------------------------------------
+    # --- 便ごとの運転時間・経過時間 ----------------------------------------
     drive = []
+    for u in range(U):
+        d = model.NewIntVar(0, 24 * 60, f"drive_u{u}")
+        model.Add(d == sum(travel[i][j] * lit for (i, j), lit in x[u].items()))
+        drive.append(d)
+
+        service_u = sum(customers[i - 1].service_min * visit[u][i] for i in range(1, n))
+        model.Add(ret[u] - depart[u] >= d + service_u).OnlyEnforceIf(used[u])
+
+        # 出さない便の時刻を遊ばせない。目的関数に効かない変数が動くと
+        # 解が毎回変わって見え、再現性の確認が難しくなる。
+        model.Add(depart[u] == depot.open_min + depot.load_min).OnlyEnforceIf(used[u].Not())
+        model.Add(ret[u] == depot.open_min + depot.load_min).OnlyEnforceIf(used[u].Not())
+        model.Add(ret[u] >= depart[u])
+
+    # --- 便の並び（同じ車） -------------------------------------------------
+    #
+    # 前の便が帰ってきて、積み直してから次の便が出る。
+    # あわせて「1便目を出さずに2便目だけ出す」を禁じる。禁じないと同じ計画が
+    # 便番号の付け替えだけで何通りにも表現でき、探索が無駄に広がるうえ、
+    # どの表現が返るかが実行ごとに変わる。
+    for v_idx in range(len(fleet)):
+        for trip in range(max_trips - 1):
+            a = unit_of[(v_idx, trip)]
+            b = unit_of[(v_idx, trip + 1)]
+            model.Add(depart[b] >= ret[a] + depot.load_min).OnlyEnforceIf(used[b])
+            model.AddImplication(used[b], used[a])
+
+    # --- 乗務員の拘束時間・運転時間（車＝人ごと） ---------------------------
+    #
+    # 上限は便ではなく人にかかる。1便ずつ見ていると、3便で拘束15時間の
+    # 計画が「どの便も短いから大丈夫」に見えてしまう。
+    duty = []
     breaks = []
-    for k, v in enumerate(vehicles):
+    vehicle_used = []
+    vehicle_drive = []
+    duty_start = []
+    duty_end = []
+    for v_idx, v in enumerate(fleet):
         d = scenario.driver(v.driver_id)
+        my_units = [unit_of[(v_idx, trip)] for trip in range(max_trips)]
+        first = my_units[0]
+        vu = used[first]           # 1便目を出す＝この車を使う
+        vehicle_used.append(vu)
 
-        drive_k = model.NewIntVar(0, d.max_drive_min, f"drive_k{k}")
-        model.Add(drive_k == sum(travel[i][j] * lit for (i, j), lit in x[k].items()))
-        drive.append(drive_k)
-
-        service_k = sum(customers[i - 1].service_min * visit[k][i] for i in range(1, n))
+        drive_v = model.NewIntVar(0, d.max_drive_min, f"drive_v{v_idx}")
+        model.Add(drive_v == sum(drive[u] for u in my_units))
+        vehicle_drive.append(drive_v)
 
         # 連続運転の休憩（改善基準告示: 連続4時間で30分）。
         #
-        # v0 の近似: 休憩を経路上のどこに挟むかは決めず、「運転時間が
-        # 4時間の区切りを越えるごとに30分ぶんの余裕を1日の中に確保する」
-        # という形で拘束時間に効かせる。挟む位置まで最適化するのは
-        # W2 で多便化するときに一緒に入れる。
+        # 近似: 休憩を経路上のどこに挟むかは決めず、「1日の運転時間が
+        # 4時間の区切りを越えるごとに30分ぶんの余裕を拘束時間の中に
+        # 確保する」という形で効かせる。挟む位置まで最適化するのは、
+        # 多コンパートメント割当を入れるときに一緒に見直す。
         #
         # 近似の向きは**安全側**にしてある。余裕を先に取るので、実際に
         # 休憩を挟んでも計画が破れない。逆向き（余裕を取らない）にすると
         # 法令上走れない計画が「解けた」ことになる。
-        n_breaks = model.NewIntVar(0, 3, f"nbreak_k{k}")
-        over1 = model.NewBoolVar(f"over1_k{k}")
-        over2 = model.NewBoolVar(f"over2_k{k}")
         limit = d.continuous_drive_limit_min
-        model.Add(drive_k > limit).OnlyEnforceIf(over1)
-        model.Add(drive_k <= limit).OnlyEnforceIf(over1.Not())
-        model.Add(drive_k > 2 * limit).OnlyEnforceIf(over2)
-        model.Add(drive_k <= 2 * limit).OnlyEnforceIf(over2.Not())
-        model.Add(n_breaks == over1 + over2)
-        break_k = model.NewIntVar(0, 3 * d.break_min, f"break_k{k}")
-        model.AddMultiplicationEquality(break_k, [n_breaks, d.break_min])
-        breaks.append(break_k)
+        n_breaks = model.NewIntVar(0, 3, f"nbreak_v{v_idx}")
+        overs = []
+        for step in (1, 2, 3):
+            o = model.NewBoolVar(f"over{step}_v{v_idx}")
+            model.Add(drive_v > step * limit).OnlyEnforceIf(o)
+            model.Add(drive_v <= step * limit).OnlyEnforceIf(o.Not())
+            overs.append(o)
+        model.Add(n_breaks == sum(overs))
+        break_v = model.NewIntVar(0, 3 * d.break_min, f"break_v{v_idx}")
+        model.AddMultiplicationEquality(break_v, [n_breaks, d.break_min])
+        breaks.append(break_v)
 
-        # 経過時間は「運転＋荷卸＋休憩」を必ず飲み込めるだけ空けておく。
-        model.Add(ret[k] - depart[k] >= drive_k + service_k + break_k).OnlyEnforceIf(
-            used[k]
+        # 拘束は「1便目の積込開始」から「最後に出した便の帰庫」まで。
+        start_v = model.NewIntVar(0, horizon, f"dutystart_v{v_idx}")
+        model.Add(start_v == depart[first] - depot.load_min)
+        end_v = model.NewIntVar(0, horizon, f"dutyend_v{v_idx}")
+        model.AddMaxEquality(end_v, [ret[u] for u in my_units])
+        duty_start.append(start_v)
+        duty_end.append(end_v)
+
+        duty_v = model.NewIntVar(0, 24 * 60, f"duty_v{v_idx}")
+        model.Add(duty_v == end_v - start_v).OnlyEnforceIf(vu)
+        model.Add(duty_v == 0).OnlyEnforceIf(vu.Not())
+        model.Add(duty_v <= d.max_duty_min)
+
+        # 休憩と積込のぶんの余裕を、拘束時間の中に確保しておく。
+        service_v = sum(
+            customers[i - 1].service_min * visit[u][i]
+            for u in my_units
+            for i in range(1, n)
         )
-        # 拘束時間は積込開始から帰着まで。上限は改善基準告示の13時間。
-        model.Add(ret[k] - depart[k] + depot.load_min <= d.max_duty_min)
+        loads_v = sum(used[u] for u in my_units) * depot.load_min
+        model.Add(duty_v >= drive_v + service_v + break_v + loads_v).OnlyEnforceIf(vu)
 
-        # 使わない車の時刻を遊ばせない。目的関数に効かない変数が動くと
-        # 解が毎回変わって見え、再現性の確認が難しくなる。
-        model.Add(depart[k] == depot.open_min + depot.load_min).OnlyEnforceIf(used[k].Not())
-        model.Add(ret[k] == depot.open_min + depot.load_min).OnlyEnforceIf(used[k].Not())
-        model.Add(ret[k] >= depart[k])
+        duty.append(duty_v)
 
     # --- 目的関数 ----------------------------------------------------------
     penalties = []
@@ -418,147 +605,205 @@ def solve(
         if p:
             penalties.append(p * (1 - served[idx]))
 
-    # 拘束時間（積込開始〜帰着）。走行と別に計上する。
-    duty = []
-    for k in range(K):
-        d_k = model.NewIntVar(0, 24 * 60, f"duty_k{k}")
-        model.Add(d_k == ret[k] - depart[k] + depot.load_min).OnlyEnforceIf(used[k])
-        model.Add(d_k == 0).OnlyEnforceIf(used[k].Not())
-        duty.append(d_k)
-
     primary = model.NewIntVar(0, 10**9, "primary")
     model.Add(
         primary
-        == sum(drive)
+        == sum(vehicle_drive)
         + DUTY_COST_PER_MIN * sum(duty)
         + sum(penalties)
-        + VEHICLE_FIXED_COST_MIN * sum(used)
+        + VEHICLE_FIXED_COST_MIN * sum(vehicle_used)
     )
 
     # --- タイブレーク（決定性のため） --------------------------------------
     #
-    # 主目的が同点のとき、どれを返すかをここで一意に決める。2項ある。
+    # 主目的が同点のとき、どれを返すかをここで一意に決める。3項ある。
     #
     # 1. 到着時刻の合計を最小化する。
     #    余裕のある立ち寄りは「窓の中ならいつでもよい」ので時刻が浮く。
     #    早い側に寄せる。副作用も望ましい方向で、着けるうちに着いておく計画に
-    #    なり、W3 で確率的な所要時間を入れたときに時間枠を割りにくくなる。
+    #    なり、M2 で確率的な所要時間を入れたときに時間枠を割りにくくなる。
     #
-    # 2. 車と需要家の組を、車番と需要家番号の**積**で決める。
-    #    1 でも同点なら、若い番号の車が若い番号の需要家を持つ側を選ぶ。
-    #    意味のある基準ではないが、**基準が無いことよりはるかにまし**。
+    # 2. 便と需要家の組を (u+1)*i^2 で決める。
+    #    最初は (u*100 + i) と書いていたが、これは u の項と i の項に分離できる
+    #    ため、2軒を2便の間で入れ替えても総和が変わらない。3号車と4号車は
+    #    槽構成も乗務員の上限も同じで完全に対称なので、実際にこの入れ替えが
+    #    実行のたびに起きていた。
     #
-    #    積にしてあるのが要点。最初は (k*100 + i) と書いていたが、これは
-    #    k の項と i の項に分離できるため、2軒を2台の間で入れ替えても総和が
-    #    変わらない。3号車と4号車は槽構成も乗務員の上限も同じで完全に対称
-    #    なので、実際にこの入れ替えが実行のたびに起きていた。
-    #    (k+1)*i^2 なら、入れ替えで必ず値が動く。
+    # 3. 回る順序を i^2*j で決める。
+    #    2 は「どの便がどの需要家を持つか」しか見ておらず、**同じ2軒を回る順**は
+    #    区別できない。実際に、5号車が周東→玖珂と玖珂→周東の間で揺れていた。
+    #    経路は閉じた輪なので、i+j や i*j のような対称・分離可能な重みでは
+    #    一周した総和がどの順でも同じになり、順序を区別できない。
+    # 到着時刻は需要家ごとに1本だけ持つ。便ごとに持つと変数が U 倍になり、
+    # 複数便にしたぶんそのまま探索が重くなる。訪問は1回きりなので1本で足りる。
     arrivals = []
-    for k in range(K):
-        for i in range(1, n):
-            a = model.NewIntVar(0, horizon, f"arr_k{k}_n{i}")
-            model.Add(a == t[k][i]).OnlyEnforceIf(visit[k][i])
-            model.Add(a == 0).OnlyEnforceIf(visit[k][i].Not())
-            arrivals.append(a)
+    for i in range(1, n):
+        a = model.NewIntVar(0, horizon, f"arrive_n{i}")
+        for u in range(U):
+            model.Add(a == t[u][i]).OnlyEnforceIf(visit[u][i])
+        model.Add(a == 0).OnlyEnforceIf(served[i - 1].Not())
+        arrivals.append(a)
 
     lexical = sum(
-        (k + 1) * (i * i) * visit[k][i] for k in range(K) for i in range(1, n)
+        (u + 1) * (i * i) * visit[u][i] for u in range(U) for i in range(1, n)
     )
-
-    # 3. 回る順序を決める。
-    #    2 は「どの車がどの需要家を持つか」しか見ておらず、**同じ2軒を回る順**は
-    #    区別できない。実際に、5号車が周東→玖珂と玖珂→周東の間で揺れていた
-    #    （到着時刻の集合まで同じで、目的値もタイブレークも一致していた）。
-    #
-    #    重みを i*i*j にしてあるのは、経路が閉じた輪だから。
-    #    i+j や i*j のような対称・分離可能な重みは、輪を一周すると
-    #    どの順で回っても総和が同じになり、順序を区別できない。
     arc_order = sum(
-        (i * i * j) * lit for k in range(K) for (i, j), lit in x[k].items()
+        (i * i * j) * lit for u in range(U) for (i, j), lit in x[u].items()
     )
 
-    tiebreak = model.NewIntVar(0, OBJECTIVE_SCALE - 1, "tiebreak")
+    tiebreak = model.NewIntVar(0, 10**7, "tiebreak")
     model.Add(tiebreak == sum(arrivals) + lexical + arc_order)
 
-    model.Minimize(primary * OBJECTIVE_SCALE + tiebreak)
+    # --- 求解（2段階の辞書式） ---------------------------------------------
+    #
+    # 主目的とタイブレークを1本の式に足し込む書き方（primary * 10^6 + tiebreak）
+    # は、単一便のときは問題なく動いた。複数便にした途端に行き詰まった。
+    # 目的式が数千項の密な線形式になり、線形緩和が効かなくなって、120秒でも
+    # 最適性を証明できなくなった。
+    #
+    # 代わりに2回解く。1回目は主目的だけ（項が疎で速い）。2回目は主目的を
+    # 見つかった最適値に固定して、タイブレークだけを最小化する。このとき
+    # 解空間は「最適な計画すべて」に狭まっているので、2回目は速い。
+    #
+    # 得られる結果は1本の式で解いた場合と同じ（辞書式順序は等価）。
+    # 違うのは速さと、**両段が最適性を証明できたかを別々に確認できる**点。
+    def _new_solver(limit: float) -> cp_model.CpSolver:
+        s = cp_model.CpSolver()
+        s.parameters.max_time_in_seconds = limit
+        s.parameters.num_workers = workers
+        s.parameters.log_search_progress = log
+        s.parameters.random_seed = scenario.seed % 2_147_483_647
+        return s
 
-    # --- 求解 --------------------------------------------------------------
-    solver = cp_model.CpSolver()
-    solver.parameters.max_time_in_seconds = time_limit_s
-    solver.parameters.num_workers = workers
-    solver.parameters.log_search_progress = log
-    # 同じ入力で同じ解が出ることを優先する。並列探索は既定で非決定的なので、
-    # 明示的に決定性を要求する（回帰テストの前提）。
-    solver.parameters.random_seed = scenario.seed % 2_147_483_647
-    status = solver.Solve(model)
-    status_name = solver.StatusName(status)
+    # 1段目に大半を使い、2段目は残りで足りる（解空間が狭いため）。
+    solver1 = _new_solver(time_limit_s * 0.75)
+    model.Minimize(primary)
+    status1 = solver1.Solve(model)
+    phase1_status = solver1.StatusName(status1)
+    phase1_time = solver1.WallTime()
+
+    solver = solver1
+    status = status1
+    status_name = phase1_status
+    phase2_status = "skipped"
+    phase2_time = 0.0
+
+    if status1 in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+        # 1段目が時間切れで最適性を証明できていない場合、そこで固定すると
+        # 「たまたま見つかった解」を最適だと言い張ることになる。その場合も
+        # 2段目は回す（主目的の値を固定した時点で解のばらつきは大きく減る）が、
+        # 診断にはっきり残す。
+        best_primary = solver1.Value(primary)
+        model.Add(primary == best_primary)
+        model.Minimize(tiebreak)
+
+        # **2段目には必ず別の solver を使う。**
+        # 同じ solver を使い回して2段目が時間切れになると、1段目の解が
+        # 上書きされて消える。それに気づかず値を読むと、変数の定義域を
+        # 超えた数字（目的値 1,760,776,892,128 や、必須訪問を6軒落とした
+        # 目的値 0）が平然と返ってきた。CpSolver は自分の応答を内部に持つので、
+        # 分けておけば1段目の解はそのまま生き残る。
+        solver2 = _new_solver(max(5.0, time_limit_s - phase1_time))
+        status2 = solver2.Solve(model)
+        phase2_status = solver2.StatusName(status2)
+        phase2_time = solver2.WallTime()
+        if status2 in (cp_model.OPTIMAL, cp_model.FEASIBLE):
+            solver = solver2
+            status = status2
+            status_name = phase2_status
+        else:
+            # 2段目が解を持たない。1段目の解をそのまま使う。
+            # タイブレークが効いていないので、この日の計画は再現性が落ちる。
+            status_name = phase1_status
 
     if status not in (cp_model.OPTIMAL, cp_model.FEASIBLE):
         return Plan(
             status=status_name,
-            routes=(),
-            unserved=tuple(
-                Unserved(c.id, c.name, c.demand_l, c.is_mandatory, c.min_days_to_empty())
-                for c in customers
-                if c.demand_l > 0
-            ),
+            vehicle_days=(),
+            unserved=_all_unserved(customers),
             total_drive_min=0,
             objective=0,
             wall_time_s=solver.WallTime(),
             scenario_date=scenario.date,
             scenario_seed=scenario.seed,
-            diagnostics={**diagnostics, "reason": "制約を同時に満たす計画が見つからない"},
+            diagnostics={
+                **diagnostics,
+                "reason": "制約を同時に満たす計画が見つからない",
+            },
         )
 
     # --- 解の取り出し ------------------------------------------------------
-    routes: list[Route] = []
-    for k, v in enumerate(vehicles):
-        if not solver.BooleanValue(used[k]):
+    vehicle_days: list[VehicleDay] = []
+    for v_idx, v in enumerate(fleet):
+        if not solver.BooleanValue(vehicle_used[v_idx]):
             continue
         d = scenario.driver(v.driver_id)
 
-        # 経路を油槽所から辿る。AddCircuit なので後続は一意に決まる。
-        order: list[int] = []
-        cur = 0
-        for _ in range(n):
-            nxt = None
-            for j in range(n):
-                if j != cur and solver.BooleanValue(x[k][(cur, j)]):
-                    nxt = j
+        trips: list[Trip] = []
+        for trip_index in range(max_trips):
+            u = unit_of[(v_idx, trip_index)]
+            if not solver.BooleanValue(used[u]):
+                continue
+
+            # 経路を油槽所から辿る。AddCircuit なので後続は一意に決まる。
+            # 枝刈りで存在しない区間があるので、全 j を舐めずに
+            # 実際に作った変数だけを見る。
+            successors = {i: [] for i in range(n)}
+            for (i, j) in x[u]:
+                successors[i].append(j)
+
+            order: list[int] = []
+            cur = 0
+            for _ in range(n):
+                nxt = None
+                for j in successors[cur]:
+                    if solver.BooleanValue(x[u][(cur, j)]):
+                        nxt = j
+                        break
+                if nxt is None or nxt == 0:
                     break
-            if nxt is None or nxt == 0:
-                break
-            order.append(nxt)
-            cur = nxt
+                order.append(nxt)
+                cur = nxt
 
-        stops = tuple(
-            Stop(
-                customer_id=customers[i - 1].id,
-                customer_name=customers[i - 1].name,
-                arrive_min=solver.Value(t[k][i]),
-                depart_min=solver.Value(t[k][i]) + customers[i - 1].service_min,
-                delivered_l=customers[i - 1].demand_l,
-                window_open_min=customers[i - 1].window_open_min,
-                window_close_min=customers[i - 1].window_close_min,
+            stops = tuple(
+                Stop(
+                    customer_id=customers[i - 1].id,
+                    customer_name=customers[i - 1].name,
+                    arrive_min=solver.Value(t[u][i]),
+                    depart_min=solver.Value(t[u][i]) + customers[i - 1].service_min,
+                    delivered_l=customers[i - 1].demand_l,
+                    window_open_min=customers[i - 1].window_open_min,
+                    window_close_min=customers[i - 1].window_close_min,
+                )
+                for i in order
             )
-            for i in order
-        )
 
-        routes.append(
-            Route(
+            trips.append(
+                Trip(
+                    vehicle_id=v.id,
+                    vehicle_name=v.name,
+                    trip_index=trip_index,
+                    load_start_min=solver.Value(depart[u]) - depot.load_min,
+                    depart_min=solver.Value(depart[u]),
+                    return_min=solver.Value(ret[u]),
+                    drive_min=solver.Value(drive[u]),
+                    load_l=solver.Value(load[u]),
+                    capacity_l=v.capacity_l,
+                    stops=stops,
+                )
+            )
+
+        vehicle_days.append(
+            VehicleDay(
                 vehicle_id=v.id,
                 vehicle_name=v.name,
                 driver_id=d.id,
                 driver_name=d.name,
-                load_start_min=solver.Value(depart[k]) - depot.load_min,
-                depart_min=solver.Value(depart[k]),
-                return_min=solver.Value(ret[k]),
-                drive_min=solver.Value(drive[k]),
-                service_min=sum(s.depart_min - s.arrive_min for s in stops),
-                break_min=solver.Value(breaks[k]),
-                load_l=solver.Value(load[k]),
-                capacity_l=v.capacity_l,
-                stops=stops,
+                duty_start_min=solver.Value(duty_start[v_idx]),
+                duty_end_min=solver.Value(duty_end[v_idx]),
+                drive_min=solver.Value(vehicle_drive[v_idx]),
+                break_min=solver.Value(breaks[v_idx]),
+                trips=tuple(trips),
             )
         )
 
@@ -576,20 +821,29 @@ def solve(
 
     return Plan(
         status=status_name,
-        routes=tuple(routes),
+        vehicle_days=tuple(vehicle_days),
         unserved=unserved,
-        total_drive_min=sum(r.drive_min for r in routes),
+        total_drive_min=sum(vd.drive_min for vd in vehicle_days),
         # 外へ出すのは主目的だけ。タイブレークは決定性のための内部事情であって、
         # 「この計画のコスト」として読まれると桁が意味を失う。
         objective=solver.Value(primary),
-        wall_time_s=solver.WallTime(),
+        # 2段の合計。最後の solver の時間だけを出すと、45秒かけた求解が
+        # 「15秒で解けた」ことになり、性能の判断を誤らせる。
+        wall_time_s=phase1_time + phase2_time,
         scenario_date=scenario.date,
         scenario_seed=scenario.seed,
         diagnostics={
             **diagnostics,
             "served_count": len(customers) - len(unserved),
+            "trip_count": sum(len(vd.trips) for vd in vehicle_days),
             "tiebreak": solver.Value(tiebreak),
-            "best_bound": solver.BestObjectiveBound() / OBJECTIVE_SCALE,
+            "phase1_status": phase1_status,
+            "phase1_time_s": round(phase1_time, 3),
+            "phase2_status": phase2_status,
+            "phase2_time_s": round(phase2_time, 3),
+            # 両段が最適性を証明できたときだけ、この計画は完全に再現できる。
+            # どちらかが時間切れなら、同じ入力でも別の計画が返り得る。
+            "reproducible": phase1_status == "OPTIMAL" and phase2_status == "OPTIMAL",
         },
     )
 
@@ -601,24 +855,32 @@ def format_plan_ja(plan: Plan) -> str:
     「何号車が、何時に出て、どこへ、何kL、何時に戻る」だけ。
     """
     lines = [f"【{plan.scenario_date} の配車】{plan.summary_ja()}", ""]
-    for r in plan.routes:
+    for vd in plan.vehicle_days:
         lines.append(
-            f"■ {r.vehicle_name}（{r.driver_name}）"
-            f"　積込 {minutes_to_hhmm(r.load_start_min)}"
-            f"／出庫 {minutes_to_hhmm(r.depart_min)}"
-            f"／帰庫 {minutes_to_hhmm(r.return_min)}"
-            f"　拘束 {r.duty_min // 60}時間{r.duty_min % 60}分"
-            f"　積載 {r.load_l / 1000:.1f}kL / {r.capacity_l / 1000:.0f}kL"
-            f"（{r.utilization * 100:.0f}%）"
+            f"■ {vd.vehicle_name}（{vd.driver_name}）"
+            f"　拘束 {minutes_to_hhmm(vd.duty_start_min)}〜"
+            f"{minutes_to_hhmm(vd.duty_end_min)}"
+            f"（{vd.duty_min // 60}時間{vd.duty_min % 60}分）"
+            f"　運転 {vd.drive_min // 60}時間{vd.drive_min % 60}分"
+            + (f"　休憩 {vd.break_min}分" if vd.break_min else "")
+            + f"　{len(vd.trips)}便で {vd.load_l / 1000:.1f}kL"
         )
-        for i, s in enumerate(r.stops, start=1):
+        for trip in vd.trips:
             lines.append(
-                f"   {i}. {minutes_to_hhmm(s.arrive_min)} {s.customer_name}"
-                f"　{s.delivered_l / 1000:.1f}kL"
-                f"　（受入 {minutes_to_hhmm(s.window_open_min)}"
-                f"〜{minutes_to_hhmm(s.window_close_min)}"
-                f"／余裕 {s.slack_min}分）"
+                f"  ‹{trip.trip_index + 1}便› 積込 {minutes_to_hhmm(trip.load_start_min)}"
+                f"／出庫 {minutes_to_hhmm(trip.depart_min)}"
+                f"／帰庫 {minutes_to_hhmm(trip.return_min)}"
+                f"　積載 {trip.load_l / 1000:.1f}kL / {trip.capacity_l / 1000:.0f}kL"
+                f"（{trip.utilization * 100:.0f}%）"
             )
+            for i, s in enumerate(trip.stops, start=1):
+                lines.append(
+                    f"      {i}. {minutes_to_hhmm(s.arrive_min)} {s.customer_name}"
+                    f"　{s.delivered_l / 1000:.1f}kL"
+                    f"　（受入 {minutes_to_hhmm(s.window_open_min)}"
+                    f"〜{minutes_to_hhmm(s.window_close_min)}"
+                    f"／余裕 {s.slack_min}分）"
+                )
         lines.append("")
 
     if plan.unserved:

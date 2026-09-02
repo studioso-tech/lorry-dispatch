@@ -106,43 +106,55 @@ def _plan_to_dict(plan: Plan) -> dict:
         "objective": plan.objective,
         "wall_time_s": round(plan.wall_time_s, 3),
         "total_drive_min": plan.total_drive_min,
-        "routes": [
+        "vehicle_days": [
             {
-                "vehicle_id": r.vehicle_id,
-                "vehicle_name": r.vehicle_name,
-                "driver_id": r.driver_id,
-                "driver_name": r.driver_name,
-                "load_start_min": r.load_start_min,
-                "load_start": minutes_to_hhmm(r.load_start_min),
-                "depart_min": r.depart_min,
-                "depart": minutes_to_hhmm(r.depart_min),
-                "return_min": r.return_min,
-                "return": minutes_to_hhmm(r.return_min),
-                "duty_min": r.duty_min,
-                "drive_min": r.drive_min,
-                "break_min": r.break_min,
-                "load_l": r.load_l,
-                "capacity_l": r.capacity_l,
-                "utilization": round(r.utilization, 3),
-                "stops": [
+                "vehicle_id": vd.vehicle_id,
+                "vehicle_name": vd.vehicle_name,
+                "driver_id": vd.driver_id,
+                "driver_name": vd.driver_name,
+                "duty_start_min": vd.duty_start_min,
+                "duty_start": minutes_to_hhmm(vd.duty_start_min),
+                "duty_end_min": vd.duty_end_min,
+                "duty_end": minutes_to_hhmm(vd.duty_end_min),
+                "duty_min": vd.duty_min,
+                "drive_min": vd.drive_min,
+                "break_min": vd.break_min,
+                "load_l": vd.load_l,
+                "trips": [
                     {
-                        "customer_id": s.customer_id,
-                        "customer_name": s.customer_name,
-                        "arrive_min": s.arrive_min,
-                        "arrive": minutes_to_hhmm(s.arrive_min),
-                        "depart_min": s.depart_min,
-                        "depart": minutes_to_hhmm(s.depart_min),
-                        "delivered_l": s.delivered_l,
-                        "window": (
-                            f"{minutes_to_hhmm(s.window_open_min)}-"
-                            f"{minutes_to_hhmm(s.window_close_min)}"
-                        ),
-                        "slack_min": s.slack_min,
+                        "trip_index": tr.trip_index,
+                        "load_start_min": tr.load_start_min,
+                        "load_start": minutes_to_hhmm(tr.load_start_min),
+                        "depart_min": tr.depart_min,
+                        "depart": minutes_to_hhmm(tr.depart_min),
+                        "return_min": tr.return_min,
+                        "return": minutes_to_hhmm(tr.return_min),
+                        "drive_min": tr.drive_min,
+                        "load_l": tr.load_l,
+                        "capacity_l": tr.capacity_l,
+                        "utilization": round(tr.utilization, 3),
+                        "stops": [
+                            {
+                                "customer_id": s.customer_id,
+                                "customer_name": s.customer_name,
+                                "arrive_min": s.arrive_min,
+                                "arrive": minutes_to_hhmm(s.arrive_min),
+                                "depart_min": s.depart_min,
+                                "depart": minutes_to_hhmm(s.depart_min),
+                                "delivered_l": s.delivered_l,
+                                "window": (
+                                    f"{minutes_to_hhmm(s.window_open_min)}-"
+                                    f"{minutes_to_hhmm(s.window_close_min)}"
+                                ),
+                                "slack_min": s.slack_min,
+                            }
+                            for s in tr.stops
+                        ],
                     }
-                    for s in r.stops
+                    for tr in vd.trips
                 ],
             }
-            for r in plan.routes
+            for vd in plan.vehicle_days
         ],
         "unserved": [
             {

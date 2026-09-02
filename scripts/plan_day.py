@@ -21,7 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from core.domain import minutes_to_hhmm  # noqa: E402
 from core.generator import generate  # noqa: E402
-from core.solver import format_plan_ja, solve  # noqa: E402
+from core.solver import DEFAULT_TIME_LIMIT_S, format_plan_ja, solve  # noqa: E402
 from core.travel import build_matrix  # noqa: E402
 
 
@@ -35,7 +35,7 @@ def main() -> int:
     ap.add_argument(
         "--absent", action="append", default=[], help="欠勤する乗務員ID（例 d1）"
     )
-    ap.add_argument("--time-limit", type=float, default=30.0)
+    ap.add_argument("--time-limit", type=float, default=DEFAULT_TIME_LIMIT_S)
     ap.add_argument("--verbose", action="store_true", help="需要と車両の内訳も出す")
     args = ap.parse_args()
 

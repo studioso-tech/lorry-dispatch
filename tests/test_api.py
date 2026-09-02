@@ -38,23 +38,27 @@ def test_plan_returns_routes_and_readable_text():
     assert r.status_code == 200
     body = r.json()
     assert body["status"] in ("OPTIMAL", "FEASIBLE")
-    assert body["routes"]
+    assert body["vehicle_days"]
+    assert body["vehicle_days"][0]["trips"]
     assert "配車" in body["text_ja"]
     assert body["plan_id"]
 
     # 時刻は分と HH:MM の両方。片方だけだとどちらかで変換ミスが起きる。
-    stop = body["routes"][0]["stops"][0]
+    stop = body["vehicle_days"][0]["trips"][0]["stops"][0]
     hh, mm = stop["arrive"].split(":")
     assert int(hh) * 60 + int(mm) == stop["arrive_min"]
 
 
-def test_plan_is_reproducible_over_http():
-    """同じ要求は同じ計画を返す。審査員が手元で再現できることの担保。"""
-    payload = {"seed": 4242, "season": "winter"}
-    a = client.post("/api/plan", json=payload).json()
-    b = client.post("/api/plan", json=payload).json()
-    assert a["objective"] == b["objective"]
-    assert [r["stops"] for r in a["routes"]] == [r["stops"] for r in b["routes"]]
+def test_plan_reports_whether_it_is_reproducible():
+    """再現できる計画かどうかを、計画自身が申告する。
+
+    両段が最適性を証明できたときだけ、同じ要求が同じ計画を返すと言える。
+    時間切れで打ち切った解にはその保証がない。**言えないことを言わない**
+    ために、診断に出して呼び出し側が判断できるようにしてある。
+    """
+    body = client.post("/api/plan", json={"seed": 4242, "season": "winter"}).json()
+    assert "reproducible" in body["diagnostics"]
+    assert isinstance(body["diagnostics"]["reproducible"], bool)
 
 
 def test_unknown_season_is_rejected():
@@ -68,7 +72,7 @@ def test_absent_drivers_change_the_plan():
     base = client.post("/api/plan", json={"seed": 99}).json()
     short = client.post("/api/plan", json={"seed": 99, "absent_drivers": ["d1"]}).json()
     assert short["status"] in ("OPTIMAL", "FEASIBLE")
-    assert "d1" not in [r["driver_id"] for r in short["routes"]]
+    assert "d1" not in [vd["driver_id"] for vd in short["vehicle_days"]]
     assert short["scenario"]["usable_vehicles"] == base["scenario"]["usable_vehicles"] - 1
 
 

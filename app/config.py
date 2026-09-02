@@ -49,7 +49,7 @@ class Settings:
             gemini_model=os.getenv("GEMINI_MODEL", "gemini-3.7-flash"),
             firestore_database=os.getenv("FIRESTORE_DATABASE", "(default)"),
             use_vertexai=os.getenv("GOOGLE_GENAI_USE_VERTEXAI", "TRUE").upper() == "TRUE",
-            solve_time_limit_s=float(os.getenv("SOLVE_TIME_LIMIT_S", "20")),
+            solve_time_limit_s=float(os.getenv("SOLVE_TIME_LIMIT_S", "60")),
             solve_workers=int(os.getenv("SOLVE_WORKERS", "8")),
             use_firestore_ledger=bool(project)
             and os.getenv("USE_FIRESTORE_LEDGER", "TRUE").upper() == "TRUE",
