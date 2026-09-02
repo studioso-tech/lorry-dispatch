@@ -1,0 +1,16 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# 環境設定（鍵や課金先が入る）
+.env
+*.key
+*-sa.json
+
+# 生成物
+data/*.json
+!data/.gitkeep

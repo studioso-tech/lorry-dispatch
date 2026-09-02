@@ -1,0 +1,5 @@
+# 開発・テスト用。本番イメージには入れない。
+-r requirements.txt
+
+pytest==8.4.2
+pytest-timeout==2.4.0
