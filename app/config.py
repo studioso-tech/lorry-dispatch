@@ -39,14 +39,30 @@ class Settings:
         return cls(
             project_id=project,
             location=os.getenv("GOOGLE_CLOUD_LOCATION", "us-central1"),
-            # Gemini API は global エンドポイント経由で呼ぶ（提供状況が安定するため）
+            # **Gemini は必ず global エンドポイントで呼ぶ。**
+            # 2026-09-03 の実機確認で、gemini-3.8-flash も 3.7-flash も
+            # us-central1 では 404（Publisher model not found）だった。
+            # global では両方とも通る。
+            #
+            # モデルを呼ぶときは location ではなく **genai_location** を使うこと。
+            # location（us-central1）は Cloud Run と Firestore 用で、別物。
             genai_location=os.getenv("GOOGLE_GENAI_LOCATION", "global"),
             # エージェント層は W4。ここはまだ実際には呼ばれない。
-            # **W4 で着手する前に models.list() で実在を確認すること。**
-            # 別プロジェクトでは 2026-08-19 時点で gemini-3.5-pro が存在せず、
-            # 3.5 以上は flash 系のみだった。モデル名を憶測で置くと、
-            # 最初の1回目の呼び出しまで誤りに気づけない。
-            gemini_model=os.getenv("GEMINI_MODEL", "gemini-3.7-flash"),
+            #
+            # **2026-09-03 に studio-so-test で実機確認済み**
+            # （scripts/check_model.py で再確認できる）。
+            #   ・カタログに存在する
+            #   ・global エンドポイントで実際に呼べる
+            #   ・us-central1 では 404。**リージョン指定では呼べない**
+            #
+            # 3.8-flash は 3.7-flash と同じ基盤の上に構築されており、改善は
+            # ソフトウェアエンジニアリングとエージェント的タスクに集中している。
+            # 単価も同じ（$0.75 / $3.75 per 1M、2026-12-31まで）。本PJの用途に
+            # 正面から合うので、こちらを既定にする。
+            #
+            # モデル名を憶測で置いてはいけない。別プロジェクトでは 2026-08-19
+            # 時点で gemini-3.5-pro が存在せず、3.5 以上は flash 系のみだった。
+            gemini_model=os.getenv("GEMINI_MODEL", "gemini-3.8-flash"),
             firestore_database=os.getenv("FIRESTORE_DATABASE", "(default)"),
             use_vertexai=os.getenv("GOOGLE_GENAI_USE_VERTEXAI", "TRUE").upper() == "TRUE",
             solve_time_limit_s=float(os.getenv("SOLVE_TIME_LIMIT_S", "60")),

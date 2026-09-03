@@ -71,6 +71,72 @@ def usage(day: str | None = None) -> dict:
     return ledger.usage(day)
 
 
+@app.post("/api/model-check")
+def model_check(subject: str = "modelcheck") -> dict:
+    """**Cloud Run 上から**モデルを1回だけ呼び、実費を測って返す。
+
+    なぜ画面でも配車でもない経路をわざわざ置くか:
+        ローカルで呼べることと、Cloud Run から呼べることは別である。
+        違うのは資格情報（実行サービスアカウントの権限）で、そこが
+        通っているかは**本番から1回呼んでみるまで分からない**。
+        エージェント層に着手する前に、ここで確かめる。
+
+        あわせて、1回の呼び出しで思考トークンが何個出るかを測る。
+        Gemini 3.x flash 系は思考トークンを出力として課金するので、
+        コスト台帳の見積り（ledger.ESTIMATES）が現実と合っているかは
+        これを見て判断する。
+
+    モデルは必ず **genai_location（global）** で呼ぶ。us-central1 では
+    404 になる（2026-09-03 実機確認）。
+    """
+    try:
+        amount = ledger.reserve(subject, "trigger")
+    except ledger.BudgetExceeded as exc:
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
+
+    try:
+        # 起動を遅くしないよう、ここで初めて読み込む。
+        from google import genai
+
+        client = genai.Client(
+            vertexai=True,
+            project=settings.project_id,
+            location=settings.genai_location,
+        )
+        response = client.models.generate_content(
+            model=settings.gemini_model,
+            contents="Reply with the single word: ok",
+        )
+    except Exception as exc:
+        ledger.release(subject, amount)
+        logger.exception("モデル呼び出しに失敗")
+        raise HTTPException(
+            status_code=502,
+            detail=f"{settings.gemini_model} を呼べません: {type(exc).__name__}: {exc}",
+        ) from exc
+
+    meta = getattr(response, "usage_metadata", None)
+    prompt_tokens = getattr(meta, "prompt_token_count", 0) or 0
+    output_tokens = getattr(meta, "candidates_token_count", 0) or 0
+    thought_tokens = getattr(meta, "thoughts_token_count", 0) or 0
+
+    ledger.record(subject, "trigger", amount, detail="model-check")
+
+    return {
+        "ok": True,
+        "model": settings.gemini_model,
+        "location": settings.genai_location,
+        "reply": (response.text or "").strip()[:100],
+        "tokens": {
+            "prompt": prompt_tokens,
+            "output": output_tokens,
+            # 思考トークンは出力として課金される。ここが実費の大半を占める。
+            "thoughts": thought_tokens,
+        },
+        "reserved_usd": amount,
+    }
+
+
 # ---------------------------------------------------------------------------
 # 配車
 # ---------------------------------------------------------------------------

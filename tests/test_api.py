@@ -138,3 +138,30 @@ def test_release_returns_the_reservation():
     amount = ledger.reserve("bob", "explain")
     ledger.release("bob", amount)
     assert ledger.usage()["total_usd"] == pytest.approx(before)
+
+
+def test_estimates_and_thinking_levels_cover_the_same_operations():
+    """コストの見積りと思考レベルが、同じ操作の一覧を持っている。
+
+    Gemini 3.x flash 系は思考トークンを出力として課金し、思考レベルを
+    上げると実費が2倍以上になる（2026-09-03 の実測: low 498トークン →
+    high 1220トークン）。見積りだけあって思考レベルの指定が漏れた操作は、
+    既定の medium で走って見積りを超える。
+
+    solve は決定論コアなのでモデルを呼ばない。ここだけ例外。
+    """
+    assert set(ledger.ESTIMATES) - {"solve"} == set(ledger.THINKING_LEVEL)
+    assert ledger.ESTIMATES["solve"] == 0.0
+    for kind, level in ledger.THINKING_LEVEL.items():
+        # 3.8-flash は minimal を受け付けない
+        assert level in ("low", "medium", "high"), (kind, level)
+
+
+def test_every_estimate_fits_under_the_per_request_cap():
+    """どの操作も、1リクエストの上限に収まっている。
+
+    見積りが上限を超えると、その操作は**必ず** 429 で弾かれる。
+    モデルを上げて見積りを引き上げたときに、静かにこうなり得る。
+    """
+    for kind, usd in ledger.ESTIMATES.items():
+        assert usd <= ledger.MAX_USD_PER_REQUEST, (kind, usd)
