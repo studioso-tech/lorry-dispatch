@@ -408,9 +408,15 @@ def solve(
     for v, veh in enumerate(fleet):
         arcs: list[tuple[int, int, cp_model.IntVar]] = []
         for i in range(N):
-            # 積載量を超える需要家には、その車では行けない
-            if i >= R and cust(i).demand_l > veh.capacity_l:
-                model.Add(active[v][i] == 0)
+            if i >= R:
+                # 積載量を超える需要家には、その車では行けない
+                if cust(i).demand_l > veh.capacity_l:
+                    model.Add(active[v][i] == 0)
+                # **トレーラーが物理的に入れない需要家がある。**
+                # 狭い道・小さい構内・切り返しの余地の無さで決まるので、
+                # 積載量とは別の制約。単車がそういう先へ優先的に回る。
+                elif veh.is_trailer and not cust(i).accepts_trailer:
+                    model.Add(active[v][i] == 0)
             arcs.append((i, i, active[v][i].Not()))
             for j in range(N):
                 if i == j:
@@ -592,23 +598,16 @@ def solve(
     #
     # 主目的が同点のとき、どれを返すかをここで一意に決める。2項ある。
     #
-    # 1. 到着時刻の合計。余裕のある立ち寄りは「窓の中ならいつでもよい」ので
-    #    時刻が浮く。早い側に寄せる。副作用も望ましい方向で、着けるうちに
-    #    着いておく計画になり、確率的な所要時間を入れたときに時間枠を
-    #    割りにくくなる。
+    # 1. 需要家ごとに重みを変えた到着時刻の和。余裕のある立ち寄りは
+    #    「窓の中ならいつでもよい」ので時刻が浮く。早い側に寄せる。
+    #    副作用も望ましい方向で、着けるうちに着いておく計画になり、
+    #    確率的な所要時間を入れたときに時間枠を割りにくくなる。
     #
     # 2. 車と需要家の組を (v+1)*i^2 で決める。最初は (v*100 + i) と書いていたが、
     #    これは v の項と i の項に分離できるため、2軒を2台の間で入れ替えても
     #    総和が変わらない。同型の車が実際にこの入れ替えを起こしていた。
     #
-    # 3. 回る順序を (i+1)^2*(j+1) で決める。経路は閉じた輪なので、i+j や i*j の
-    #    ような対称・分離可能な重みでは、一周した総和が順序で変わらない。
-    #    節点の添字をそのまま使うので、油槽所の複製（＝何便目か）も区別できる。
-    #
-    # 需要家ごとに重みを変えた到着時刻の和（sum((i+1)*arrive_i)）で 3 を
-    # 置き換えて項数を減らす案を試したが、**遅くなった**（2段目 15〜19秒 →
-    # 15〜47秒、5件中2件が証明できず）。係数の大きい整数項は、数の多い
-    # 小さな真偽項より線形緩和に効かないらしい。
+    # 3. 上の2つを、**下位が上位を打ち消せない大きさに分離する**（下記）。
     arrivals = []
     for c_idx in range(C):
         node = R + c_idx
@@ -618,17 +617,36 @@ def solve(
         model.Add(a == 0).OnlyEnforceIf(served[c_idx].Not())
         arrivals.append(a)
 
+    # 需要家ごとに重みを変えた到着時刻の和。
+    # 重みが全部1（素の合計）だと、時刻の集合が同じで割り当てだけ違う解を
+    # 区別できない。重みを変えれば「どの軒が早い時刻を取るか」で値が動く。
+    # 重みはすべて正なので、早く着く計画が選ばれる性質は保たれる。
+    weighted_arrivals = sum((c_idx + 1) * arrivals[c_idx] for c_idx in range(C))
+
     lexical = sum(
         (v + 1) * ((c_idx + 1) ** 2) * active[v][R + c_idx]
         for v in range(V)
         for c_idx in range(C)
     )
-    arc_order = sum(
-        ((i + 1) ** 2) * (j + 1) * lit for v in range(V) for (i, j), lit in x[v].items()
-    )
 
-    tiebreak = model.NewIntVar(0, 10**7, "tiebreak")
-    model.Add(tiebreak == sum(arrivals) + lexical + arc_order)
+    # **段を数値で分離する。** 下位の段が上位の段を打ち消せない大きさにする。
+    #
+    # 以前は「到着時刻の素の合計」と「区間ごとの重み ((i+1)^2*(j+1))」を
+    # そのまま足していた。桁が同程度だったため、実際に打ち消し合った:
+    #
+    #     c02→c03 の順: 到着の和 730 ＋ 区間 55 = 785
+    #     c03→c02 の順: 到着の和 724 ＋ 区間 61 = 785
+    #
+    # 到着時刻では後者が6小さく、区間の重みでは前者が6小さい。ちょうど
+    # 相殺して同点になり、どちらが返るかが実行のたびに変わっていた。
+    #
+    # 区間ごとの重みは廃止した。「どの軒がどの時刻を取るか」を見れば
+    # 訪問順は決まるので、重み付きの到着時刻1本で足りる。
+    LEXICAL_MAX = V * sum((i + 1) ** 2 for i in range(C))
+    ARRIVAL_SCALE = LEXICAL_MAX + 1
+
+    tiebreak = model.NewIntVar(0, 10**12, "tiebreak")
+    model.Add(tiebreak == weighted_arrivals * ARRIVAL_SCALE + lexical)
 
     # --- 求解（2段階の辞書式） ---------------------------------------------
     #

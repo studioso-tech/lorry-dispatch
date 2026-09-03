@@ -73,6 +73,36 @@ class CustomerType(str, Enum):
     SUBURBAN_GS = "suburban_gs"        # 郊外GS                   → 灯油比率高・タンク小
 
 
+class VehicleClass(str, Enum):
+    """ローリーの車格。**積載量だけの違いではない。**
+
+    単車は小回りが利くので、狭い道・小さい構内・切り返しの余地がない
+    需要家へ入れる。トレーラーは同じ場所へ物理的に入れない。
+
+    容量は実在する型式に合わせる（それ以外の数字を置かない）:
+        単車       14kL / 16kL
+        トレーラー 18kL / 20kL / 24kL / 26kL
+    """
+
+    RIGID = "rigid"        # 単車
+    TRAILER = "trailer"    # トレーラー
+
+
+#: 車格ごとに実在する積載量（L）。ここに無い容量の車を作らない。
+#:
+#: 最初の実装では 10kL の車を置いていたが、**そんなローリーは無い**。
+#: 作り物の車で組んだ計画は、作り物の制約しか検証しない。
+CAPACITIES_L: dict[VehicleClass, tuple[int, ...]] = {
+    VehicleClass.RIGID: (14_000, 16_000),
+    VehicleClass.TRAILER: (18_000, 20_000, 24_000, 26_000),
+}
+
+VEHICLE_CLASS_JA: dict[VehicleClass, str] = {
+    VehicleClass.RIGID: "単車",
+    VehicleClass.TRAILER: "トレーラー",
+}
+
+
 class LegClass(str, Enum):
     """区間の幹線区分。
 
@@ -168,6 +198,13 @@ class Customer:
     window_close_min: int     # 受入終了。この時刻までに**荷卸を始められる**こと
     service_min: int          # 荷卸に要する時間（着車〜出発）
 
+    #: トレーラーが入れるか。**荷役条件のマスターに載っている情報**。
+    #:
+    #: 小さいSSや運送会社の構内は、狭い道・切り返しの余地の無さで
+    #: トレーラーが物理的に入れない。そこには単車が優先的に配車される。
+    #: 積載量の問題ではないので、容量制約とは別に持つ。
+    accepts_trailer: bool = True
+
     @property
     def demand_l(self) -> int:
         """今日この需要家に降ろす量の合計。
@@ -226,14 +263,34 @@ class Vehicle:
 
     id: str
     name: str
+    vehicle_class: VehicleClass
     compartments_l: tuple[int, ...]
     driver_id: str
     requires_hazmat: bool = True   # 危険物取扱者が要る。乗務員資格と突き合わせる
 
+    def __post_init__(self) -> None:
+        """実在しない容量の車を作らせない。
+
+        黙って通すと、作り物の車で組んだ計画を現実だと思って読むことになる。
+        """
+        allowed = CAPACITIES_L[self.vehicle_class]
+        total = sum(self.compartments_l)
+        if total not in allowed:
+            raise ValueError(
+                f"{self.id}: {VEHICLE_CLASS_JA[self.vehicle_class]}に "
+                f"{total / 1000:.0f}kL 積は無い"
+                f"（{'/'.join(f'{c // 1000}kL' for c in allowed)} のいずれか）"
+            )
+
     @property
     def capacity_l(self) -> int:
-        """総積載量。v0 の単槽 CVRPTW ではこれを容量制約に使う。"""
+        """総積載量。単槽 CVRPTW ではこれを容量制約に使う。"""
         return sum(self.compartments_l)
+
+    @property
+    def is_trailer(self) -> bool:
+        """トレーラーか。入れない需要家があるので、経路の可否に効く。"""
+        return self.vehicle_class is VehicleClass.TRAILER
 
 
 @dataclass(frozen=True)

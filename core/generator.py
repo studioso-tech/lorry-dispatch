@@ -38,7 +38,9 @@ from core.domain import (
     Product,
     Scenario,
     Tank,
+    VEHICLE_CLASS_JA,
     Vehicle,
+    VehicleClass,
     hhmm_to_minutes,
 )
 
@@ -212,18 +214,47 @@ ULLAGE_RATIO = 0.05
 # 車両・乗務員
 # ---------------------------------------------------------------------------
 
-#: ローリー5台。槽構成は実車に多い 4槽で、容量の組み合わせを散らしてある。
-#: 全部同じ容量にすると「どの車を出しても同じ」になり、多コンパートメント
-#: 割当（W2）で解く意味が消える。
-FLEET: tuple[tuple[str, str, tuple[int, ...]], ...] = (
-    ("v1", "1号車（16kL）", (4_000, 4_000, 4_000, 4_000)),
-    ("v2", "2号車（16kL）", (4_000, 4_000, 4_000, 4_000)),
-    ("v3", "3号車（14kL）", (4_000, 3_000, 3_000, 4_000)),
-    ("v4", "4号車（14kL）", (4_000, 3_000, 3_000, 4_000)),
-    ("v5", "5号車（10kL）", (3_000, 3_000, 2_000, 2_000)),
+#: 保有するローリー。**容量は実在する型式だけを使う。**
+#:
+#: 単車       14kL / 16kL
+#: トレーラー 18kL / 20kL / 24kL / 26kL
+#:
+#: 最初の実装では 10kL の車を置いていたが、そんなローリーは無い。
+#: 作り物の車で組んだ計画は、作り物の制約しか検証しない。
+#:
+#: 単車を混ぜてあるのは容量の都合ではなく、**トレーラーが物理的に入れない
+#: 需要家があるから**。狭い道・小さい構内・切り返しの余地の無さで決まる。
+#: 単車だけ、あるいはトレーラーだけの編成にすると、この制約が消えてしまう。
+#:
+#: 台数と構成そのものは、本来この生成器が決めることではない。
+#: 元売りが半期（4-9月／10-3月）ごとに専属契約の台数を提示し、運送会社が
+#: それに非専属を足す。**何台要るかは体制設計層が掃引で出す答え**であって、
+#: ここはその掃引の出発点にすぎない。
+FLEET: tuple[tuple[str, str, VehicleClass, tuple[int, ...]], ...] = (
+    ("v1", "1号車", VehicleClass.TRAILER, (5_000, 5_000, 5_000, 5_000, 4_000)),   # 24kL
+    ("v2", "2号車", VehicleClass.TRAILER, (5_000, 5_000, 5_000, 5_000)),          # 20kL
+    ("v3", "3号車", VehicleClass.TRAILER, (5_000, 4_000, 5_000, 4_000)),          # 18kL
+    ("v4", "4号車", VehicleClass.RIGID, (4_000, 4_000, 4_000, 4_000)),            # 16kL
+    ("v5", "5号車", VehicleClass.RIGID, (4_000, 3_000, 3_000, 4_000)),            # 14kL
 )
 
 DRIVER_NAMES: tuple[str, ...] = ("乗務員A", "乗務員B", "乗務員C", "乗務員D", "乗務員E")
+
+#: 類型ごとに、トレーラーが入れるか。**荷役条件のマスターに載っている情報**。
+#:
+#: 郊外GSはタンクが小さく構内も狭い。運送会社の営業所も、車庫の配置次第で
+#: 大型が回せないところがある。単車はそういう先へ優先的に配車される。
+ACCEPTS_TRAILER: dict[CustomerType, bool] = {
+    CustomerType.URBAN_GS_24H: True,
+    CustomerType.URBAN_GS_DAY: True,
+    CustomerType.SANIN_GS: True,
+    CustomerType.CARRIER_DEPOT: True,
+    CustomerType.SUBURBAN_GS: False,   # 郊外GSは単車のみ
+}
+
+#: 類型に関わらず単車しか入れない需要家。個別の事情（前面道路が狭い等）。
+#: 実務では荷役条件マスターに1軒ずつ持っている情報を、ここで代用している。
+RIGID_ONLY_CUSTOMERS: frozenset[str] = frozenset({"c08"})   # 岩国装束運輸
 
 
 # ---------------------------------------------------------------------------
@@ -309,6 +340,10 @@ def generate(
                 window_open_min=hhmm_to_minutes(profile.window_open),
                 window_close_min=hhmm_to_minutes(profile.window_close),
                 service_min=profile.service_min,
+                accepts_trailer=(
+                    ACCEPTS_TRAILER[spec.type]
+                    and spec.id not in RIGID_ONLY_CUSTOMERS
+                ),
             )
         )
 
@@ -324,11 +359,12 @@ def generate(
     vehicles = tuple(
         Vehicle(
             id=vid,
-            name=vname,
+            name=f"{vname}（{VEHICLE_CLASS_JA[vclass]} {sum(comps) // 1000}kL）",
+            vehicle_class=vclass,
             compartments_l=comps,
             driver_id=f"d{i + 1}",
         )
-        for i, (vid, vname, comps) in enumerate(FLEET)
+        for i, (vid, vname, vclass, comps) in enumerate(FLEET)
     )
 
     return Scenario(

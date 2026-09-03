@@ -327,3 +327,56 @@ def test_skipping_the_tiebreak_phase_keeps_the_cost():
         assert full.objective == quick.objective
     assert quick.diagnostics["phase2_status"] == "skipped"
     assert quick.diagnostics["reproducible"] is False
+
+
+def test_trailers_never_enter_customers_that_cannot_take_them():
+    """トレーラーが入れない需要家に、トレーラーを配車しない。
+
+    **積載量の制約ではない。** 狭い道・小さい構内・切り返しの余地の無さで
+    決まる物理的な可否で、荷役条件のマスターに載っている情報。
+    単車がそういう先へ優先的に回る。
+    """
+    for seed in SEEDS:
+        scenario, _, plan = _plan(seed=seed)
+        by_id = {c.id: c for c in scenario.customers}
+        fleet = {v.id: v for v in scenario.vehicles}
+        for tr in plan.trips:
+            if not fleet[tr.vehicle_id].is_trailer:
+                continue
+            for s in tr.stops:
+                assert by_id[s.customer_id].accepts_trailer, (
+                    f"{tr.vehicle_id}（トレーラー）が {s.customer_name} に入っている"
+                )
+
+
+def test_rigid_only_customers_exist_in_the_scenario():
+    """単車しか入れない需要家が実際にいること。
+
+    全軒がトレーラーを受け入れる名簿だと、この制約が一度も効かない飾りに
+    なる。デモで見せる制約は、デモのデータで発火しなければ意味がない。
+    """
+    s = generate(seed=20261015, season="winter")
+    rigid_only = [c for c in s.customers if not c.accepts_trailer]
+    assert rigid_only, "単車のみの需要家が1軒も無い"
+    assert any(v.is_trailer for v in s.vehicles), "トレーラーが1台も無い"
+    assert any(not v.is_trailer for v in s.vehicles), "単車が1台も無い"
+
+
+def test_only_real_capacities_exist():
+    """実在しない容量のローリーを作らない。
+
+    最初の実装には 10kL の車が居た。そんなローリーは無い。作り物の車で
+    組んだ計画は、作り物の制約しか検証しない。
+    """
+    from core.domain import CAPACITIES_L, Vehicle, VehicleClass
+
+    s = generate(seed=1)
+    for v in s.vehicles:
+        assert v.capacity_l in CAPACITIES_L[v.vehicle_class], (v.id, v.capacity_l)
+
+    # 型の側でも弾いていること
+    with pytest.raises(ValueError, match="kL 積は無い"):
+        Vehicle(
+            id="bad", name="10kL", vehicle_class=VehicleClass.RIGID,
+            compartments_l=(5_000, 5_000), driver_id="d1",
+        )
