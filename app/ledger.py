@@ -6,12 +6,20 @@
     （W4）を書く前に**枠組みだけ先に置く。あとから足す台帳は、必ずどこかの
     経路を通し忘れる。
 
-三層で守る:
+四層で守る:
     1. 1リクエストの上限   — 1回の再計画が青天井に膨らまない
     2. 利用者ごとの1日上限 — 一人が使いすぎない
-    3. 全体の1日上限       — 何人来ても請求が青天井にならない最後の砦
+    3. 全体の1日上限       — 何人来ても1日で使い切らない
+    4. **全体の1か月上限** — 請求書に載る単位で止める最後の砦
 
-    3 が本命。2 だけだと、識別子を変えられれば素通りする。
+    4 が本命。GCP の予算アラートは**通知するだけで支出を止めない**。
+    実際に止められるのはここだけである。日次上限だけだと、毎日上限まで
+    使って月末に30倍になる。
+
+台帳はリクエストを**またいだ**上限しか見ない:
+    1リクエストの**中**で50回ループされても、台帳が知っているのは
+    「1回予約した」ことだけで素通りする。そこは app/meter.py（実測）と
+    app/guardrails.py（回数と時間の上限）が受け持つ。
 
 先に確保してから使う:
     生成してから記録すると、上限を越えた分を後追いで知ることになる。
@@ -44,9 +52,31 @@ logger = logging.getLogger("lorry.ledger")
 # 1リクエストの上限が要点。配車の再計画は「シグナルを読む→制約に翻訳する→
 # 説明を書く」で数回モデルを呼ぶ設計なので、1回あたり $0.10 は十分な余裕が
 # ありつつ、暴走した場合に1回で止まる水準。
+# 上限の根拠は「月にいくらまで使ってよいか」ではない。
+# **一度の暴走でいくらまで飛ぶか**である。
+#
+# 過去に ADK の暴走で、無料クレジットの半分（2万数千円分）を**一度に**
+# 失ったことがある。上限が無ければ、残高がある限り走り続ける。
+#
+# GCP の予算アラート（¥500 に設定済み）は、無料クレジットが尽きて実課金に
+# 切り替わったことを知らせるための警報であって、支出を止めるものではない。
+# **止められるのはここだけ。**
+#
+# 実測の目安（2026-09-03）:
+#   Gemini 3.8 Flash 1回              約 $0.002
+#   求解1回（Cloud Run 4vCPU × 60秒） 約 $0.006  ← モデルより高い
+#
+# 既定値が意味するもの:
+#   1リクエスト $0.10  … 1回の暴走が約15円で頭打ちになる
+#   1日 全体 $2.00     … 丸1日暴走し続けても約300円
+#   1か月 全体 $15.00  … 最悪の月で約2,250円。過去の事故の10分の1以下
+#
+# 審査期間の想定使用量は、審査員が触るぶんで $1〜4 程度（1往復 $0.02 × 数百回）。
+# 通常の利用は妨げず、暴走したときだけ効く水準に置いてある。
 MAX_USD_PER_REQUEST = float(os.getenv("MAX_USD_PER_REQUEST", "0.10"))
-DAILY_USD_PER_SUBJECT = float(os.getenv("DAILY_USD_PER_SUBJECT", "1.00"))
-DAILY_USD_GLOBAL = float(os.getenv("DAILY_USD_GLOBAL", "10.00"))
+DAILY_USD_PER_SUBJECT = float(os.getenv("DAILY_USD_PER_SUBJECT", "0.50"))
+DAILY_USD_GLOBAL = float(os.getenv("DAILY_USD_GLOBAL", "2.00"))
+MONTHLY_USD_GLOBAL = float(os.getenv("MONTHLY_USD_GLOBAL", "15.00"))
 
 # --- 操作ごとの想定コスト（USD） -------------------------------------------
 #
@@ -108,7 +138,9 @@ class BudgetExceeded(Exception):
     """上限に達したので実行しない。
 
     scope は "request"（1回で使いすぎ）/ "subject"（その人が使いすぎ）/
-    "global"（全体で使いすぎ）。どれかで配車係への伝え方が変わる。
+    "global"（その日に全体で使いすぎ）/ "month"（今月使い切った）。
+    どれかで配車係への伝え方が変わる。month だけは「明日まで待っても
+    直らない」ので、伝え方が根本的に違う。
     """
 
     def __init__(self, scope: str, spent: float, cap: float):
@@ -122,12 +154,17 @@ def _today() -> str:
     return datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
 
+def _this_month() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m")
+
+
 # ---------------------------------------------------------------------------
 # メモリ版（開発用）
 # ---------------------------------------------------------------------------
 
 _lock = threading.Lock()
 _memory: dict[str, dict[str, Any]] = {}
+_memory_months: dict[str, float] = {}
 _entries: list[dict[str, Any]] = []
 
 
@@ -150,6 +187,18 @@ def _day_ref(day: str):
     from app.firestore_client import collection, get_client
 
     return get_client().collection(collection("ledger")).document(day)
+
+
+def _month_ref(month: str):
+    """今月の合計。日次とは別のドキュメントに持つ。
+
+    月をまたいだ集計を日次ドキュメントの走査で出すこともできるが、
+    予約のたびに30件読むことになる。上限判定は毎回通る経路なので、
+    1件で済む形にしておく。
+    """
+    from app.firestore_client import collection, get_client
+
+    return get_client().collection(collection("ledger_month")).document(month)
 
 
 def backend() -> str:
@@ -184,17 +233,24 @@ def reserve(subject: str, kind: str, usd: float | None = None) -> float:
 
     day = _today()
 
+    month = _this_month()
+
     if not settings.use_firestore_ledger:
         with _lock:
             d = _memory_day(day)
             total = float(d["total_usd"])
             mine = float(d["subjects"].get(subject, 0.0))
+            month_total = _memory_months.get(month, 0.0)
+            # 月を先に見る。明日まで待っても直らないほうから弾く。
+            if month_total + amount > MONTHLY_USD_GLOBAL:
+                raise BudgetExceeded("month", month_total, MONTHLY_USD_GLOBAL)
             if total + amount > DAILY_USD_GLOBAL:
                 raise BudgetExceeded("global", total, DAILY_USD_GLOBAL)
             if mine + amount > DAILY_USD_PER_SUBJECT:
                 raise BudgetExceeded("subject", mine, DAILY_USD_PER_SUBJECT)
             d["total_usd"] = total + amount
             d["subjects"][subject] = mine + amount
+            _memory_months[month] = month_total + amount
         return amount
 
     from google.cloud import firestore
@@ -202,16 +258,23 @@ def reserve(subject: str, kind: str, usd: float | None = None) -> float:
     from app.firestore_client import get_client
 
     ref = _day_ref(day)
+    mref = _month_ref(month)
 
     @firestore.transactional
     def _txn(txn):
+        # **読みは全部、書きより先に。** Firestore のトランザクションの規則。
         snap = ref.get(transaction=txn)
+        msnap = mref.get(transaction=txn)
+
         data = snap.to_dict() if snap.exists else {}
         total = float(data.get("total_usd", 0.0))
         subjects = data.get("subjects", {})
         mine = float(subjects.get(subject, 0.0))
+        month_total = float((msnap.to_dict() or {}).get("total_usd", 0.0)) if msnap.exists else 0.0
 
-        # 全体を先に見る。ここが最後の砦なので、個人の枠より優先して弾く。
+        # 広いほうから弾く。月が尽きているなら、明日まで待っても直らない。
+        if month_total + amount > MONTHLY_USD_GLOBAL:
+            raise BudgetExceeded("month", month_total, MONTHLY_USD_GLOBAL)
         if total + amount > DAILY_USD_GLOBAL:
             raise BudgetExceeded("global", total, DAILY_USD_GLOBAL)
         if mine + amount > DAILY_USD_PER_SUBJECT:
@@ -219,6 +282,7 @@ def reserve(subject: str, kind: str, usd: float | None = None) -> float:
 
         subjects[subject] = mine + amount
         txn.set(ref, {"day": day, "total_usd": total + amount, "subjects": subjects})
+        txn.set(mref, {"month": month, "total_usd": month_total + amount})
 
     _txn(get_client().transaction())
     return amount
@@ -232,6 +296,8 @@ def release(subject: str, amount: float) -> None:
     """
     day = _today()
 
+    month = _this_month()
+
     if not settings.use_firestore_ledger:
         with _lock:
             d = _memory_day(day)
@@ -239,6 +305,7 @@ def release(subject: str, amount: float) -> None:
             d["subjects"][subject] = max(
                 0.0, float(d["subjects"].get(subject, 0.0)) - amount
             )
+            _memory_months[month] = max(0.0, _memory_months.get(month, 0.0) - amount)
         return
 
     from google.cloud import firestore
@@ -246,10 +313,12 @@ def release(subject: str, amount: float) -> None:
     from app.firestore_client import get_client
 
     ref = _day_ref(day)
+    mref = _month_ref(month)
 
     @firestore.transactional
     def _txn(txn):
         snap = ref.get(transaction=txn)
+        msnap = mref.get(transaction=txn)
         if not snap.exists:
             return
         data = snap.to_dict()
@@ -263,6 +332,9 @@ def release(subject: str, amount: float) -> None:
                 "subjects": subjects,
             },
         )
+        if msnap.exists:
+            mtotal = float((msnap.to_dict() or {}).get("total_usd", 0.0))
+            txn.set(mref, {"month": month, "total_usd": max(0.0, mtotal - amount)})
 
     try:
         _txn(get_client().transaction())
@@ -320,16 +392,29 @@ def usage(day: str | None = None) -> dict[str, Any]:
         snap = _day_ref(day).get()
         data = snap.to_dict() if snap.exists else {"day": day, "total_usd": 0.0, "subjects": {}}
 
+    month = _this_month()
+    if not settings.use_firestore_ledger:
+        with _lock:
+            month_total = _memory_months.get(month, 0.0)
+    else:
+        msnap = _month_ref(month).get()
+        month_total = float((msnap.to_dict() or {}).get("total_usd", 0.0)) if msnap.exists else 0.0
+
     return {
         "day": day,
+        "month": month,
         "backend": backend(),
         "total_usd": round(float(data.get("total_usd", 0.0)), 6),
+        "month_total_usd": round(month_total, 6),
         "subjects": data.get("subjects", {}),
         "caps": {
             "per_request_usd": MAX_USD_PER_REQUEST,
             "per_subject_daily_usd": DAILY_USD_PER_SUBJECT,
             "global_daily_usd": DAILY_USD_GLOBAL,
+            "global_monthly_usd": MONTHLY_USD_GLOBAL,
         },
+        # 予算アラートは通知するだけで支出を止めない。実際に止まるのは上の上限。
+        "note": "GCPの予算アラートは通知のみ。支出を止めるのはこの上限だけ。",
     }
 
 
@@ -337,6 +422,7 @@ def reset_for_tests() -> None:
     """メモリ版の台帳を空にする。テスト専用。"""
     with _lock:
         _memory.clear()
+        _memory_months.clear()
         _entries.clear()
 
 
@@ -347,6 +433,7 @@ __all__ = [
     "ESTIMATES",
     "THINKING_LEVEL",
     "MAX_USD_PER_REQUEST",
+    "MONTHLY_USD_GLOBAL",
     "backend",
     "estimate",
     "record",
