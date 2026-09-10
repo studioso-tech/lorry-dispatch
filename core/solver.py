@@ -145,6 +145,9 @@ class Trip:
     load_l: int              # この便で積んだ量
     capacity_l: int
     stops: tuple[Stop, ...]
+    #: この便の走行距離。所要時間行列が持っているのに出していなかった。
+    #: **現実と突き合わせるための数字**（下記 VehicleDay.drive_km 参照）。
+    drive_km: float = 0.0
 
     @property
     def service_min(self) -> int:
@@ -189,6 +192,21 @@ class VehicleDay:
     def load_l(self) -> int:
         """1日に運んだ量の合計。"""
         return sum(t.load_l for t in self.trips)
+
+    @property
+    def drive_km(self) -> float:
+        """1日の走行距離。
+
+        **モデルが現実に合っているかを見る物差し。**
+        回転数（1台3回転程度）も走行距離（1台500〜600km程度）も、業務上の
+        制約ではなく**結果**である。だから便数の上限で縛るのではなく、
+        枠を緩めた結果としてこの水準が出てくるかどうかを見る。
+
+        ここが現実の半分しか出ないなら、需要か台数か所要時間のどれかが
+        ずれている。台数を減らして1台が現実的に埋まる点を探せば、それが
+        そのまま「何台要るか」の答えになる。
+        """
+        return sum(t.drive_km for t in self.trips)
 
     @property
     def stop_count(self) -> int:
@@ -779,10 +797,9 @@ def solve(
                 if end_node == 0
                 else solver.Value(t[v][end_node]) - load_min
             )
-            trip_drive = sum(
-                travel[mat(a)][mat(b)]
-                for a, b in zip([start_node] + nodes, nodes + [end_node])
-            )
+            legs = list(zip([start_node] + nodes, nodes + [end_node]))
+            trip_drive = sum(travel[mat(a)][mat(b)] for a, b in legs)
+            trip_km = sum(matrix.km[mat(a)][mat(b)] for a, b in legs)
             trips.append(
                 Trip(
                     vehicle_id=veh.id,
@@ -792,6 +809,7 @@ def solve(
                     depart_min=depart_min,
                     return_min=return_min,
                     drive_min=trip_drive,
+                    drive_km=round(trip_km, 1),
                     load_l=sum(s.delivered_l for s in stops),
                     capacity_l=veh.capacity_l,
                     stops=stops,
@@ -847,6 +865,21 @@ def solve(
             "served_count": sum(len(t.stops) for vd in vehicle_days for t in vd.trips),
             "no_demand_count": sum(1 for c in customers if c.demand_l <= 0),
             "trip_count": sum(len(vd.trips) for vd in vehicle_days),
+            # **現実と突き合わせるための実績値。**
+            # 回転数も走行距離も業務上の制約ではなく結果なので、便数の上限で
+            # 縛らず、出てきた値がこの水準に届くかを見る。
+            #   実務の目安: 1台あたり 3回転前後 / 500〜600km / 拘束13時間前後
+            "per_vehicle_actuals": [
+                {
+                    "vehicle": vd.vehicle_id,
+                    "trips": len(vd.trips),
+                    "drive_km": round(vd.drive_km, 1),
+                    "drive_min": vd.drive_min,
+                    "duty_min": vd.duty_min,
+                    "load_kl": round(vd.load_l / 1000, 1),
+                }
+                for vd in vehicle_days
+            ],
             "tiebreak": solver.Value(tiebreak),
             "phase1_status": phase1_status,
             "phase1_time_s": round(phase1_time, 3),
@@ -876,6 +909,7 @@ def format_plan_ja(plan: Plan) -> str:
             f"{minutes_to_hhmm(vd.duty_end_min)}"
             f"（{vd.duty_min // 60}時間{vd.duty_min % 60}分）"
             f"　運転 {vd.drive_min // 60}時間{vd.drive_min % 60}分"
+            f"／{vd.drive_km:.0f}km"
             + (f"　休憩 {vd.break_min}分" if vd.break_min else "")
             + f"　{len(vd.trips)}便で {vd.load_l / 1000:.1f}kL"
         )

@@ -37,9 +37,31 @@ from typing import Sequence
 
 from core.domain import Customer, Depot, LegClass
 
-#: 直線距離に対する実道路距離の比。中国地方の山がちな地形で 1.3〜1.4 程度。
-#: これを 1.0 に置くと計画が楽観に振れ、時間枠を割る計画が「解けた」ことになる。
-WINDING_FACTOR = 1.35
+#: 直線距離に対する実道路距離の比。**区分ごとに変える。**
+#:
+#: 当初は全区分を一律 1.35 にしていたが、実際の道路距離と突き合わせたら
+#: 系統的に短すぎた（2026-09-10 に検算）。
+#:
+#:     需要家              直線   モデル   実際   実際の迂回率
+#:     廿日市物流センター    19      26     25     1.32
+#:     広島中央SS          30      40     48     1.60
+#:     宇品港SS            28      38     50     1.79
+#:     浜田SS              79     106    140     1.77
+#:     益田SS              63      85    130     2.06
+#:     玖珂SS              12      16     22     1.83
+#:
+#: 実際は 1.32〜2.06、平均 1.73。**山越えは 1.8〜2.1**。中国山地を越える道が
+#: 直線からどれだけ回り込むかを甘く見ていた。
+#:
+#: 距離が短いと所要時間も短くなるので、楽観側に倒れた計画が出る。
+#: 「実際より楽に回れる」前提の計画は、時間枠を割ってから気づくことになる。
+#: **迂回率は安全側（大きめ）に置く。**
+WINDING_FACTOR: dict[LegClass, float] = {
+    LegClass.URBAN: 1.75,        # 市街地。一方通行と河川の橋で回り込む
+    LegClass.ARTERIAL: 1.70,     # 幹線一般道
+    LegClass.EXPRESSWAY: 1.55,   # 高速は比較的まっすぐ。IC への出入りで増える
+    LegClass.MOUNTAIN: 1.85,     # 山越え。谷筋に沿って大きく迂回する
+}
 
 #: 区間区分ごとの平均速度（km/h）。ローリーは大型で、法定と積載の両方で遅い。
 #: 高速の 75 は制限80に対する実勢、市街地の 24 は信号待ち込みの実効値。
@@ -172,7 +194,7 @@ def build_matrix(depot: Depot, customers: Sequence[Customer]) -> TravelMatrix:
                 continue
             straight = haversine_km(lats[i], lons[i], lats[j], lons[j])
             leg = classify_leg(lats[i], lons[i], lats[j], lons[j], straight)
-            road_km = straight * WINDING_FACTOR
+            road_km = straight * WINDING_FACTOR[leg]
             base_min = road_km / SPEED_KMH[leg] * 60.0
             if leg is LegClass.EXPRESSWAY:
                 base_min += EXPRESSWAY_ACCESS_MIN
