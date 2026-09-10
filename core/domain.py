@@ -53,10 +53,16 @@ DELIVERY_LOOKAHEAD_DAYS = 2.0
 #:     拘束 ≤ 360分（6時間）        → 労働 ≤ 6時間  → 0分
 #:     拘束 ≤ 525分（480 + 45）     → 労働 ≤ 8時間  → 45分
 #:     拘束 > 525分                 → 労働 8時間超  → 60分
-LABOR_BREAK_DUTY_45_MIN = 360
-LABOR_BREAK_DUTY_60_MIN = 525
 LABOR_BREAK_45_MIN = 45
 LABOR_BREAK_60_MIN = 60
+
+#: 段の境目を**労働時間**で持つ。条文が語っているのはこちら。
+LABOR_WORK_45_MIN = 360    # 労働6時間
+LABOR_WORK_60_MIN = 480    # 労働8時間
+
+#: 同じ段を**拘束時間**で見たときの境目（上の逆算）。
+LABOR_BREAK_DUTY_45_MIN = LABOR_WORK_45_MIN
+LABOR_BREAK_DUTY_60_MIN = LABOR_WORK_60_MIN + LABOR_BREAK_45_MIN
 
 
 def labor_break_min(duty_min: int) -> int:

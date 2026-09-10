@@ -14,13 +14,26 @@
     需要（季節 × 複数日）を固定し、台数を1台ずつ増やしながら
     「欠品ゼロで回る最小の台数」を探す。台数が答えで、そこから乗務員数が出る。
 
-    乗務員数は台数と同数から始める。ただし拘束時間が上限に張り付いている
-    車があれば、その車は1人では回せない＝二交代が要る。
+    乗務員数は体制案ごとに決まる。**二交代は当日の需要では切り替えられない。**
+    設備（夜間に降ろせる先）と人事（採用・シフト）が先に要るので、体制は
+    **曜日の周期で固定**される。実務では日曜に解除する（SSの休業で配送量が
+    減るため）。
+
+        案A: 1交代（乗務員 = 台数）
+        案B: 2交代（月〜土は乗務員 = 台数×2、日曜は解除）
+
+    **いまは案Aしか評価できない。** 車と人が `Vehicle.driver_id` で
+    1対1に固定されていて、二交代を表せないため（docs/業務前提.md §5.2）。
 
 なぜ複数日で見るか:
     1日だけ見て決めた台数は、その日の需要のばらつきに引きずられる。
     在庫水準は日替わりなので、切迫する軒数も日によって変わる。
     複数日の**最悪の日**で足りる台数でないと、その日に欠品する。
+
+    **本来の単位は1週間。** 体制が曜日の周期で固定される以上、日曜だけを
+    見れば少ない台数で足りるが、それでは月曜が回らない。いまの掃引は
+    曜日を持たない「N日ぶん」を見ているので、**ここはまだ正しくない**
+    （生成器が曜日で需要を動かせないため。docs/業務前提.md §5.2）。
 
 使い方:
     python -m scripts.size_fleet
@@ -50,7 +63,11 @@ from core.travel import build_matrix  # noqa: E402
 ADD_ORDER: tuple[str, ...] = ("v4", "v5", "v1", "v2", "v3")
 
 #: 拘束時間がこの割合を超えていたら「張り付いている」と見なす。
-#: 1人では回しきれない＝二交代を検討する水準。
+#:
+#: **これは二交代の判定ではない。** 二交代は日ごとに選べる運用ではなく、
+#: 設備と人事から決まる恒常的な体制なので、日ごとの逼迫から導けない。
+#: ここで言えるのは「**1交代では余裕が無い**」までで、その先は体制案の
+#: 比較（案A/案B）の仕事になる。
 DUTY_TIGHT_RATIO = 0.92
 
 
@@ -154,20 +171,25 @@ def main() -> int:
 
     size, rows = answer
     tight = [r for r in rows if r.duty_is_tight]
-    drivers = size * 2 if tight else size
 
-    print(f"【{args.season} の答え】")
+    print(f"【{args.season} の答え（1交代を前提）】")
     print(f"  必要なローリー: **{size}台**")
     for i, vid in enumerate(ADD_ORDER[:size]):
         v = next(x for x in FLEET if x[0] == vid)
         print(f"      {v[1]}  {VEHICLE_CLASS_JA[v[2]]} {sum(v[3]) // 1000}kL")
-    print(f"  必要な乗務員: **{drivers}名**", end="")
+    print(f"  必要な乗務員: **{size}名**（1台1人）")
     if tight:
-        print(f"（拘束が上限近くまで張り付く日があるため二交代。"
-              f"最長 {max(r.max_duty_min for r in tight) // 60}時間"
-              f"{max(r.max_duty_min for r in tight) % 60:02d}分）")
+        worst = max(r.max_duty_min for r in tight)
+        print()
+        print(f"  ただし拘束が上限に張り付く日があります"
+              f"（最長 {worst // 60}時間{worst % 60:02d}分 / 上限 "
+              f"{rows[0].max_duty_cap_min // 60}時間）。")
+        print("  **1交代では余裕がありません。** 需要が少し増えれば崩れます。")
+        print("  二交代を敷くかは、ここではなく体制の判断になります。")
+        print("  日ごとに選べるものではなく、夜間に降ろせる先の確保と")
+        print("  乗務員の採用が先に要る、恒常的な決定です。")
     else:
-        print("（1台1人で足りる。拘束に余裕がある）")
+        print("（拘束に余裕がある）")
     print(f"  1日あたり総走行: {sum(r.total_km for r in rows) / len(rows):.0f}km")
     print(f"  1台あたり: {sum(r.trips for r in rows) / len(rows) / size:.1f}回転 / "
           f"{sum(r.total_km for r in rows) / len(rows) / size:.0f}km")

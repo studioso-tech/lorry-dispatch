@@ -58,6 +58,8 @@ from core.domain import (
     LABOR_BREAK_60_MIN,
     LABOR_BREAK_DUTY_45_MIN,
     LABOR_BREAK_DUTY_60_MIN,
+    LABOR_WORK_45_MIN,
+    LABOR_WORK_60_MIN,
     Customer,
     LegClass,
     Scenario,
@@ -629,6 +631,14 @@ def solve(
         # 当初は(a)だけを入れていた。拘束13時間の計画に休憩が30分しか
         # 積まれておらず、**労基法上30分足りない計画**を出していた。
 
+        # 拘束の中身のうち、経路が決まれば動かせない部分。
+        # 休憩の下限を先に効かせるために、休憩より前に作っておく。
+        service_v = sum(
+            cust(R + c_idx).service_min * active[v][R + c_idx] for c_idx in range(C)
+        )
+        loads_v = sum(active[v][r] for r in range(R)) * load_min
+        work_v = drive_v + service_v + loads_v
+
         # --- (a) 430休憩 ---
         #
         # 近似: 休憩を経路上のどこに挟むかは決めず、「1日の運転時間が
@@ -639,18 +649,22 @@ def solve(
         # 休憩を挟んでも計画が破れない。逆向き（余裕を取らない）にすると
         # 法令上走れない計画が「解けた」ことになる。
         limit = d.continuous_drive_limit_min
-        n_breaks = model.NewIntVar(0, 3, f"nbreak_v{v}")
         overs = []
         for step in (1, 2, 3):
             o = model.NewBoolVar(f"over{step}_v{v}")
             model.Add(drive_v > step * limit).OnlyEnforceIf(o)
             model.Add(drive_v <= step * limit).OnlyEnforceIf(o.Not())
+            if overs:
+                model.AddImplication(o, overs[-1])   # 3区切り超なら2区切りも超えている
             overs.append(o)
-        model.Add(n_breaks == sum(overs))
+        # 掛け算制約（休憩回数 × 30分）で書いていたが、係数が定数なので
+        # 一次式で足りる。掛け算はソルバー側で別扱いになり、伝播も弱い。
         break_430 = model.NewIntVar(0, 3 * d.break_min, f"break430_v{v}")
-        model.AddMultiplicationEquality(break_430, [n_breaks, d.break_min])
+        model.Add(break_430 == d.break_min * sum(overs))
 
-        duty_v = model.NewIntVar(0, 24 * 60, f"duty_v{v}")
+        # 定義域は最初から上限に合わせる。24時間で作って後から
+        # duty_v <= max_duty_min を足すより、探索が素直になる。
+        duty_v = model.NewIntVar(0, d.max_duty_min, f"duty_v{v}")
 
         # --- (b) 労基法34条 ---
         #
@@ -679,16 +693,42 @@ def solve(
         model.AddMaxEquality(break_v, [break_430, break_labor])
         breaks.append(break_v)
 
+        # --- (b') 冗長制約: 労働時間の下限から休憩の下限を先に決める ---
+        #
+        # (b) は拘束時間に依存し、拘束時間は休憩に依存する。この循環のせいで
+        # ソルバーは経路がほぼ確定するまで休憩を絞り込めず、**60秒で最適性を
+        # 証明できる割合が 3/5 から 1/5 に落ちた**。両段で最適性を証明できた
+        # ときだけ計画が再現できるので、これは機能の劣化にあたる。
+        #
+        # 逃げ道は、休憩に依存しない下限を別に与えること。
+        # 労働時間 ＝ 拘束 − 休憩 ≧ 走行 + 荷卸 + 積込（＝ work_v）であり、
+        # work_v は経路変数の一次式なので、拘束が決まる前に評価できる。
+        #
+        #     work_v > 労働6時間 → 労働 > 6時間 → 休憩 ≧ 45分
+        #     work_v > 労働8時間 → 労働 > 8時間 → 休憩 ≧ 60分
+        #
+        # (b) から導けるので**論理は何も足していない**。手待ち時間があると
+        # 労働は work_v より長くなるため、この式だけでは足りない場合がある。
+        # だから (b) を置き換えるのではなく、併存させる。
+        w6 = model.NewBoolVar(f"work6_v{v}")
+        w8 = model.NewBoolVar(f"work8_v{v}")
+        model.Add(work_v > LABOR_WORK_45_MIN).OnlyEnforceIf(w6)
+        model.Add(work_v <= LABOR_WORK_45_MIN).OnlyEnforceIf(w6.Not())
+        model.Add(work_v > LABOR_WORK_60_MIN).OnlyEnforceIf(w8)
+        model.Add(work_v <= LABOR_WORK_60_MIN).OnlyEnforceIf(w8.Not())
+        model.AddImplication(w8, w6)
+        model.Add(
+            break_v
+            >= LABOR_BREAK_45_MIN * w6
+            + (LABOR_BREAK_60_MIN - LABOR_BREAK_45_MIN) * w8
+        )
+
         model.Add(duty_v == duty_end[v] - (t[v][0] - load_min)).OnlyEnforceIf(used[v])
         model.Add(duty_v == 0).OnlyEnforceIf(used[v].Not())
         model.Add(duty_v <= d.max_duty_min)
 
         # 休憩と積込のぶんの余裕を、拘束時間の中に確保しておく。
-        service_v = sum(
-            cust(R + c_idx).service_min * active[v][R + c_idx] for c_idx in range(C)
-        )
-        loads_v = sum(active[v][r] for r in range(R)) * load_min
-        model.Add(duty_v >= drive_v + service_v + break_v + loads_v).OnlyEnforceIf(used[v])
+        model.Add(duty_v >= work_v + break_v).OnlyEnforceIf(used[v])
         duty.append(duty_v)
 
     # --- 目的関数 ----------------------------------------------------------
