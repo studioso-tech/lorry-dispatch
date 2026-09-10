@@ -14,3 +14,4 @@ venv/
 # 生成物
 data/*.json
 !data/.gitkeep
+.scratch/
