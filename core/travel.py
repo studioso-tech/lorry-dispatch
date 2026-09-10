@@ -56,25 +56,49 @@ from core.domain import Customer, Depot, LegClass
 #: 距離が短いと所要時間も短くなるので、楽観側に倒れた計画が出る。
 #: 「実際より楽に回れる」前提の計画は、時間枠を割ってから気づくことになる。
 #: **迂回率は安全側（大きめ）に置く。**
-WINDING_FACTOR: dict[LegClass, float] = {
-    LegClass.URBAN: 1.75,        # 市街地。一方通行と河川の橋で回り込む
-    LegClass.ARTERIAL: 1.70,     # 幹線一般道
-    LegClass.EXPRESSWAY: 1.55,   # 高速は比較的まっすぐ。IC への出入りで増える
-    LegClass.MOUNTAIN: 1.85,     # 山越え。谷筋に沿って大きく迂回する
-}
+# **迂回率は地形で決まり、速度は高速を使うかで決まる。別の話なので分けて持つ。**
+#
+# 一度は区分（LegClass）から迂回率も速度も引いていたが、浜田を高速扱いに
+# した途端に迂回率まで下がって距離が 140km → 122km に縮んだ。高速に乗ろうが
+# 中国山地は迂回する。地形は道路の種類では変わらない。
+WINDING_MOUNTAIN = 1.90   # 山越え。谷筋に沿って大きく回り込む（実測 1.77〜2.06）
+WINDING_URBAN = 1.75      # 市街地。一方通行と河川の橋
+WINDING_FLAT = 1.70       # それ以外（実測 1.32〜1.83）
 
 #: 区間区分ごとの平均速度（km/h）。ローリーは大型で、法定と積載の両方で遅い。
-#: 高速の 75 は制限80に対する実勢、市街地の 24 は信号待ち込みの実効値。
+#:
+#: 高速の 62 は「山陽道・中国道の巡航」と「IC 前後の一般道」を均した実勢。
+#: 制限速度の 80 をそのまま使うと、山陰便が現実より1時間近く速く着く。
+#: 実際の所要時間と突き合わせて置いた値（下の build_matrix の検算参照）。
+#:
+#: 山越えの 36 は**下道の山道**（錦町・湯来のような、高速の並行しない区間）。
+#: 浜田・益田は距離が50kmを超えるので高速側に入り、この値は使わない。
 SPEED_KMH: dict[LegClass, float] = {
     LegClass.URBAN: 24.0,
-    LegClass.ARTERIAL: 38.0,
-    LegClass.EXPRESSWAY: 75.0,
-    LegClass.MOUNTAIN: 42.0,
+    LegClass.ARTERIAL: 42.0,
+    LegClass.EXPRESSWAY: 62.0,
+    LegClass.MOUNTAIN: 40.0,
 }
 
 #: 高速を使う区間で、IC への出入りに食われる固定時間（分）。
-#: 短距離で高速が常に有利になってしまうのを防ぐ。
+#:
+#: 麻里布からの入口は**大竹IC と岩国IC の2か所で、主に大竹**。油槽所から
+#: IC までの下道と、降車IC から需要家までの下道が、この時間に相当する。
+#: これが無いと短距離でも高速が常に有利になり、実際の配車と食い違う。
 EXPRESSWAY_ACCESS_MIN = 12.0
+
+#: 高速に乗るかどうかの分かれ目（道路距離 km）。
+#:
+#: **元売が高速代を負担するので、運送会社にとっては時間だけの判断になる。**
+#: ただし油槽所から一定の距離までは、IC への出入りに食われるぶん下道のほうが
+#: 効率がよい。効率は「時間と費用の最小」で、実務の目安は **50km 前後**。
+#:
+#: 例: 廿日市のSSへは「大竹ICで乗り廿日市ICで降りる」か「国道2号で行く」かの
+#: 比較になる（道路距離 32km なので下道側）。
+#:
+#: 基準を超える区間で高速を使うのは元売負担だが、**基準内なのに運送会社の
+#: 判断で高速を使う場合は自腹**になる。その費用はまだモデルに入れていない。
+EXPRESSWAY_THRESHOLD_KM = 50.0
 
 EARTH_RADIUS_KM = 6371.0088
 
@@ -88,32 +112,62 @@ def haversine_km(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
     return 2 * EARTH_RADIUS_KM * math.asin(math.sqrt(a))
 
 
+#: 分類を決めるための仮の迂回率。
+#: 高速に乗るかは**道路距離**で決まるのに、その道路距離は区分ごとの迂回率で
+#: 決まる、という循環がある。まず幹線の迂回率で仮の距離を出して分類し、
+#: 決まった区分の迂回率で距離を出し直す。
+_PROVISIONAL_WINDING = WINDING_FLAT
+
+_HIROSHIMA = (34.39, 132.46)
+
+
+def _is_mountainous(lat1: float, lon1: float, lat2: float, lon2: float) -> bool:
+    """中国山地を越える区間か。**高速に乗るかとは無関係の、地形の話。**"""
+    return max(lat1, lat2) > 34.60 and min(lon1, lon2) < 132.30
+
+
+def _is_urban(lat1: float, lon1: float, lat2: float, lon2: float) -> bool:
+    """両端とも広島市中心部か。"""
+    return (
+        haversine_km(lat1, lon1, *_HIROSHIMA) < 12.0
+        and haversine_km(lat2, lon2, *_HIROSHIMA) < 12.0
+    )
+
+
+def winding_for(lat1: float, lon1: float, lat2: float, lon2: float) -> float:
+    """その区間の迂回率。地形だけで決まる。"""
+    if _is_mountainous(lat1, lon1, lat2, lon2):
+        return WINDING_MOUNTAIN
+    if _is_urban(lat1, lon1, lat2, lon2):
+        return WINDING_URBAN
+    return WINDING_FLAT
+
+
 def classify_leg(
     lat1: float, lon1: float, lat2: float, lon2: float, straight_km: float
 ) -> LegClass:
     """区間の性格を座標と距離から決める。
 
-    v0 の割り切り。W3 では実在の幹線（国道2号、山陽道、広島呉道路）に
-    紐付けた leg_class を持たせるので、この関数は係数プロファイルを引く
-    ためのキー生成に置き換わる。
+    **高速に乗るかどうかを最初に見る。** 高速代は元売が負担するので、
+    基準を超える区間では使わない理由がない。当初は「直線35km超」で
+    判定していたが、これだと麻里布→広島（直線30km）まで一般道扱いになり、
+    平均速度が35km/hしか出ずに走行距離が現実の半分になっていた。
+
+    実務の基準は**道路距離50km前後**（EXPRESSWAY_THRESHOLD_KM）。
 
     判定順に意味がある:
-        1. 両端が広島市中心部に近ければ市街地
-        2. 山陰側（北緯34.6度以北かつ内陸）に跨るなら山越え
-        3. 長距離なら高速が現実的
+        1. 道路距離が基準を超えるなら高速（大竹ICから乗る）
+        2. 両端が広島市中心部に近ければ市街地
+        3. 山陰側に跨るなら山越え（高速の並行しない下道）
         4. それ以外は幹線一般道
     """
-    hiroshima = (34.39, 132.46)
-
-    def near_hiroshima(lat: float, lon: float) -> bool:
-        return haversine_km(lat, lon, *hiroshima) < 12.0
-
-    if near_hiroshima(lat1, lon1) and near_hiroshima(lat2, lon2):
-        return LegClass.URBAN
-    if max(lat1, lat2) > 34.60 and min(lon1, lon2) < 132.30:
-        return LegClass.MOUNTAIN
-    if straight_km > 35.0:
+    road_km = straight_km * winding_for(lat1, lon1, lat2, lon2)
+    if road_km > EXPRESSWAY_THRESHOLD_KM:
         return LegClass.EXPRESSWAY
+    if _is_urban(lat1, lon1, lat2, lon2):
+        return LegClass.URBAN
+    if _is_mountainous(lat1, lon1, lat2, lon2):
+        return LegClass.MOUNTAIN
     return LegClass.ARTERIAL
 
 
@@ -194,7 +248,7 @@ def build_matrix(depot: Depot, customers: Sequence[Customer]) -> TravelMatrix:
                 continue
             straight = haversine_km(lats[i], lons[i], lats[j], lons[j])
             leg = classify_leg(lats[i], lons[i], lats[j], lons[j], straight)
-            road_km = straight * WINDING_FACTOR[leg]
+            road_km = straight * winding_for(lats[i], lons[i], lats[j], lons[j])
             base_min = road_km / SPEED_KMH[leg] * 60.0
             if leg is LegClass.EXPRESSWAY:
                 base_min += EXPRESSWAY_ACCESS_MIN
