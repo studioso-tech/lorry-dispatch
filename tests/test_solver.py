@@ -380,3 +380,148 @@ def test_only_real_capacities_exist():
             id="bad", name="10kL", vehicle_class=VehicleClass.RIGID,
             compartments_l=(5_000, 5_000), driver_id="d1",
         )
+
+
+# ---------------------------------------------------------------------------
+# 休憩（労基法34条 ＋ 改善基準告示の430休憩）
+# ---------------------------------------------------------------------------
+
+
+def test_labor_break_steps():
+    """労基法34条の階段が正しいこと。**上に段を作らない。**
+
+    「拘束12時間を超えたらさらに30分」という上乗せは法令に無い。12時間で
+    1時間30分、16時間で2時間といった比例付与は義務づけられていない
+    （厚労省の解釈も6時間超45分・8時間超1時間の二段のみ）。
+    ここに勝手な段を足すと、法令上不要な休憩で拘束を膨らませ、
+    「回れない」と嘘をつく計画が出る。
+
+    判定の基準が**労働時間**（＝拘束−休憩）であることも押さえておく。
+    閾値 525分 は 480分（労働8時間）＋ 45分（休憩）の逆算。
+    """
+    from core.domain import labor_break_min
+
+    assert labor_break_min(0) == 0
+    assert labor_break_min(360) == 0        # 拘束6時間ちょうど → 労働6時間 → 不要
+    assert labor_break_min(361) == 45
+    assert labor_break_min(525) == 45       # 労働8時間ちょうど → 45分で足りる
+    assert labor_break_min(526) == 60
+    assert labor_break_min(780) == 60       # 拘束13時間 → 60分。ここで打ち止め
+    assert labor_break_min(900) == 60       # 15時間でも60分のまま
+
+
+@pytest.mark.parametrize("seed", SEEDS)
+def test_break_satisfies_both_laws(seed):
+    """休憩が両方の法令を満たしていること。**足し算ではなく大きいほう。**
+
+    430休憩（連続運転4時間ごとに30分）は、2024年4月の改正で「原則として
+    休憩」とされ、荷積み・荷卸しを算入できなくなった。つまり430の30分は
+    労基法34条の休憩の内数であって、別枠ではない。
+
+    当初は430だけを入れていて、拘束13時間の計画に休憩が30分しか積まれて
+    いなかった。**労基法上30分足りない計画**を出していたことになる。
+    """
+    from core.domain import labor_break_min
+
+    _s, _m, plan = _plan(seed)
+    for vd in plan.vehicle_days:
+        if not vd.trips:
+            continue
+        need_labor = labor_break_min(vd.duty_min)
+        need_430 = 0
+        d = 240
+        while vd.drive_min > d:
+            need_430 += 30
+            d += 240
+        assert vd.break_min >= need_labor, (
+            f"{vd.vehicle_id}: 拘束{vd.duty_min}分に休憩{vd.break_min}分。"
+            f"労基法34条は{need_labor}分を要求する"
+        )
+        assert vd.break_min >= need_430, (
+            f"{vd.vehicle_id}: 運転{vd.drive_min}分に休憩{vd.break_min}分。"
+            f"430休憩は{need_430}分を要求する"
+        )
+
+
+@pytest.mark.parametrize("seed", SEEDS)
+def test_duty_contains_every_component(seed):
+    """拘束時間が、走行・積込・荷卸・休憩をすべて含んでいること。
+
+    どれか1つを落とすと、拘束13時間の枠に入りきらない計画が
+    「入った」ことになって出てくる。
+    """
+    s, _m, plan = _plan(seed)
+    svc = {c.id: c.service_min for c in s.customers}
+    for vd in plan.vehicle_days:
+        if not vd.trips:
+            continue
+        load = len(vd.trips) * s.depot.load_min
+        service = sum(svc[st.customer_id] for t in vd.trips for st in t.stops)
+        assert vd.duty_min >= vd.drive_min + load + service + vd.break_min, (
+            f"{vd.vehicle_id}: 拘束{vd.duty_min} < "
+            f"走行{vd.drive_min}+積込{load}+荷卸{service}+休憩{vd.break_min}"
+        )
+        assert vd.duty_min <= s.driver(
+            next(v for v in s.vehicles if v.id == vd.vehicle_id).driver_id
+        ).max_duty_min
+
+
+def test_break_location_risk_detects_stranded_trip():
+    """休憩を取る場所が無い便を検出できること。
+
+    **ローリーはどこででも休憩できない。** 停められるのは油槽所の待機場、
+    高速道路のSA/PA、運送会社の車庫のいずれか。コンビニや路上に停めると
+    クレームになる（ローリーは元売りの看板を背負って走っている）。
+    需要家の構内も、荷役中は労働時間なので休憩に算入できない。
+
+    危ないのは「高速に乗らない便で連続運転が4時間を超える」形。
+    いまの15軒の名簿では発火しないが、名簿が増えて1便5〜6軒の郊外ループが
+    出てくると境目に来る。**発火しない検出器は、壊れていても分からない。**
+    """
+    from core.domain import LegClass
+    from core.solver import Stop, Trip, VehicleDay, _break_location_risk
+    from core.travel import TravelMatrix
+
+    customers = generate(seed=1).customers[:2]
+    n = 3
+    arterial = tuple(tuple(LegClass.ARTERIAL for _ in range(n)) for _ in range(n))
+    express = tuple(
+        tuple(LegClass.EXPRESSWAY if (i, j) == (0, 1) else LegClass.ARTERIAL
+              for j in range(n))
+        for i in range(n)
+    )
+    zeros = tuple(tuple(0 for _ in range(n)) for _ in range(n))
+    zerosf = tuple(tuple(0.0 for _ in range(n)) for _ in range(n))
+
+    def matrix(leg):
+        return TravelMatrix(
+            labels=("depot",) + tuple(c.name for c in customers),
+            minutes=zeros, km=zerosf, leg_class=leg,
+        )
+
+    def day(drive_min):
+        stops = tuple(
+            Stop(customer_id=c.id, customer_name=c.name, arrive_min=0,
+                 depart_min=0, delivered_l=1000,
+                 window_open_min=c.window_open_min,
+                 window_close_min=c.window_close_min)
+            for c in customers
+        )
+        trip = Trip(
+            vehicle_id="v1", vehicle_name="1号車", trip_index=1,
+            load_start_min=0, depart_min=0, return_min=drive_min,
+            drive_min=drive_min, load_l=2000, capacity_l=16000, stops=stops,
+        )
+        return [VehicleDay(
+            vehicle_id="v1", vehicle_name="1号車", driver_id="d1",
+            driver_name="乗務員A", duty_start_min=0, duty_end_min=drive_min,
+            drive_min=drive_min, break_min=60, trips=(trip,),
+        )]
+
+    # 4時間以内 → 油槽所へ戻って取れる
+    assert _break_location_risk(day(200), matrix(arterial), customers, 240) == []
+    # 4時間超 かつ 一般道だけ → 停める場所が無い
+    risk = _break_location_risk(day(300), matrix(arterial), customers, 240)
+    assert len(risk) == 1 and risk[0]["vehicle"] == "v1"
+    # 4時間超 だが 高速に乗る → SA/PA が使える
+    assert _break_location_risk(day(300), matrix(express), customers, 240) == []

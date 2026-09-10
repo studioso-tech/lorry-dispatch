@@ -10,6 +10,7 @@
     - 容量制約つき配送計画（CVRP）
     - 需要家の受入時間枠（TW）
     - 乗務員の拘束時間・運転時間・連続運転の休憩（改善基準告示）
+    - 労働基準法34条の休憩（430休憩とは別条。足さず、大きいほうを取る）
     - 発注点割れの需要家は必須訪問、それ以外は任意（切迫度で重み付け）
     - 1台が1日に複数便を回る（油槽所へ戻って積み直す）
 
@@ -52,7 +53,17 @@ from dataclasses import dataclass, field
 
 from ortools.sat.python import cp_model
 
-from core.domain import Customer, Scenario, Vehicle, minutes_to_hhmm
+from core.domain import (
+    LABOR_BREAK_45_MIN,
+    LABOR_BREAK_60_MIN,
+    LABOR_BREAK_DUTY_45_MIN,
+    LABOR_BREAK_DUTY_60_MIN,
+    Customer,
+    LegClass,
+    Scenario,
+    Vehicle,
+    minutes_to_hhmm,
+)
 from core.travel import TravelMatrix, build_matrix
 
 # ---------------------------------------------------------------------------
@@ -297,6 +308,51 @@ def _all_unserved(customers) -> tuple[Unserved, ...]:
         for c in customers
         if c.demand_l > 0
     )
+
+
+def _break_location_risk(
+    vehicle_days, matrix: TravelMatrix, customers, limit_min: int
+) -> list[dict]:
+    """休憩を取る場所が無い便を洗い出す。
+
+    **ローリーはどこででも休憩できない。** 停められるのは実質この3つ:
+
+        - 麻里布油槽所の待機場（便と便の間。積込で戻るので回送が要らない）
+        - 高速道路のSA/PA（その便が高速に乗っている場合だけ）
+        - 運送会社の車庫（戻る回送が要る）
+
+    コンビニや路上に停めるとクレームになる。ローリーは**元売りの看板を
+    背負って走っている**ので、不適切な場所に停まっていること自体が元売り
+    への苦情になり、運送会社の信用に返ってくる。需要家の構内も駄目で、
+    荷役中は労働時間なので休憩に算入できない（2024年改正の430休憩）。
+
+    危ないのは「**高速に乗らない便で、連続運転が4時間を超える**」形。
+    油槽所へも戻らず高速のSAも無いので、車庫まで回送するしかない。
+    郊外を1便5〜6軒でつなぐループがちょうどこの境目に来る。
+
+    ここでは検出だけを行い、計画は変えない。制約として入れるかは、
+    回送の時間をどう見積もるかが決まってからにする。
+    """
+    index = {c.id: i + 1 for i, c in enumerate(customers)}
+    risks = []
+    for vd in vehicle_days:
+        for t in vd.trips:
+            if t.drive_min <= limit_min:
+                continue   # 4時間以内に油槽所へ戻るので、そこで取れる
+            nodes = [0] + [index[st.customer_id] for st in t.stops] + [0]
+            legs = list(zip(nodes, nodes[1:]))
+            if any(matrix.leg_class[i][j] is LegClass.EXPRESSWAY for i, j in legs):
+                continue   # SA/PA が使える
+            risks.append(
+                {
+                    "vehicle": t.vehicle_id,
+                    "trip_index": t.trip_index,
+                    "drive_min": t.drive_min,
+                    "stops": [st.customer_id for st in t.stops],
+                    "reason": "高速に乗らない便で連続運転が4時間超。停める場所が無い",
+                }
+            )
+    return risks
 
 
 def solve(
@@ -561,7 +617,19 @@ def solve(
         )
         drive.append(drive_v)
 
-        # 連続運転の休憩（改善基準告示: 連続4時間で30分）。
+        # 休憩は**二つの法令から別々に来る**。足し合わせてはいけない。
+        #
+        #   (a) 改善基準告示の430休憩: 連続運転4時間ごとに合計30分
+        #   (b) 労働基準法34条:        労働8時間超で1時間（6時間超なら45分）
+        #
+        # 2024年4月の改正で、430の「運転の中断」は**原則として休憩**とされ、
+        # 荷積み・荷卸しを算入できなくなった。つまり(a)の30分は(b)の内数で
+        # あって別枠ではない。要る休憩は**両者の大きいほう**になる。
+        #
+        # 当初は(a)だけを入れていた。拘束13時間の計画に休憩が30分しか
+        # 積まれておらず、**労基法上30分足りない計画**を出していた。
+
+        # --- (a) 430休憩 ---
         #
         # 近似: 休憩を経路上のどこに挟むかは決めず、「1日の運転時間が
         # 4時間の区切りを越えるごとに30分ぶんの余裕を拘束時間の中に
@@ -579,11 +647,38 @@ def solve(
             model.Add(drive_v <= step * limit).OnlyEnforceIf(o.Not())
             overs.append(o)
         model.Add(n_breaks == sum(overs))
-        break_v = model.NewIntVar(0, 3 * d.break_min, f"break_v{v}")
-        model.AddMultiplicationEquality(break_v, [n_breaks, d.break_min])
-        breaks.append(break_v)
+        break_430 = model.NewIntVar(0, 3 * d.break_min, f"break430_v{v}")
+        model.AddMultiplicationEquality(break_430, [n_breaks, d.break_min])
 
         duty_v = model.NewIntVar(0, 24 * 60, f"duty_v{v}")
+
+        # --- (b) 労基法34条 ---
+        #
+        # 判定の基準は労働時間（＝拘束−休憩）だが、ここで持っているのは
+        # 拘束時間なので、逆算した拘束時間の閾値で判定する（domain.py）。
+        # 拘束が休憩に依存し、休憩が拘束に依存する循環になるが、CP-SAT には
+        # 代入ではなく制約として渡すので、そのまま解ける。
+        over6 = model.NewBoolVar(f"over6_v{v}")
+        over8 = model.NewBoolVar(f"over8_v{v}")
+        model.Add(duty_v > LABOR_BREAK_DUTY_45_MIN).OnlyEnforceIf(over6)
+        model.Add(duty_v <= LABOR_BREAK_DUTY_45_MIN).OnlyEnforceIf(over6.Not())
+        model.Add(duty_v > LABOR_BREAK_DUTY_60_MIN).OnlyEnforceIf(over8)
+        model.Add(duty_v <= LABOR_BREAK_DUTY_60_MIN).OnlyEnforceIf(over8.Not())
+        model.AddImplication(over8, over6)   # 伝播を助けるだけ。論理は上で閉じている
+        break_labor = model.NewIntVar(0, LABOR_BREAK_60_MIN, f"breaklabor_v{v}")
+        model.Add(
+            break_labor
+            == LABOR_BREAK_45_MIN * over6
+            + (LABOR_BREAK_60_MIN - LABOR_BREAK_45_MIN) * over8
+        )
+
+        # --- 大きいほうを取る ---
+        break_v = model.NewIntVar(
+            0, max(3 * d.break_min, LABOR_BREAK_60_MIN), f"break_v{v}"
+        )
+        model.AddMaxEquality(break_v, [break_430, break_labor])
+        breaks.append(break_v)
+
         model.Add(duty_v == duty_end[v] - (t[v][0] - load_min)).OnlyEnforceIf(used[v])
         model.Add(duty_v == 0).OnlyEnforceIf(used[v].Not())
         model.Add(duty_v <= d.max_duty_min)
@@ -880,6 +975,16 @@ def solve(
                 }
                 for vd in vehicle_days
             ],
+            # 休憩を取る場所が無い便。**計画は変えていない**（検出のみ）。
+            "break_location_risk": _break_location_risk(
+                vehicle_days,
+                matrix,
+                customers,
+                min(
+                    scenario.driver(v.driver_id).continuous_drive_limit_min
+                    for v in fleet
+                ) if fleet else 240,
+            ),
             "tiebreak": solver.Value(tiebreak),
             "phase1_status": phase1_status,
             "phase1_time_s": round(phase1_time, 3),
