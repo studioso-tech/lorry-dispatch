@@ -25,7 +25,9 @@ from app import ledger
 from app.config import settings
 from core.domain import minutes_to_hhmm
 from core.generator import generate
-from core.solver import Plan, SolveMode, format_plan_ja, solve
+from core.domain import Product
+from core.replan import NewOrder, format_replan_ja, replan
+from core.solver import Plan, SolveMode, VehicleDay, format_plan_ja, solve
 from core.travel import build_matrix
 
 logging.basicConfig(level=logging.INFO)
@@ -170,6 +172,60 @@ class PlanRequest(BaseModel):
     )
 
 
+def _vehicle_days_to_list(vehicle_days: tuple[VehicleDay, ...]) -> list[dict]:
+    """車ごとの1日を JSON にする。朝の計画と当日の組み直しで共有する。"""
+    return [
+        {
+            "vehicle_id": vd.vehicle_id,
+            "vehicle_name": vd.vehicle_name,
+            "driver_id": vd.driver_id,
+            "driver_name": vd.driver_name,
+            "duty_start_min": vd.duty_start_min,
+            "duty_start": minutes_to_hhmm(vd.duty_start_min),
+            "duty_end_min": vd.duty_end_min,
+            "duty_end": minutes_to_hhmm(vd.duty_end_min),
+            "duty_min": vd.duty_min,
+            "drive_min": vd.drive_min,
+            "break_min": vd.break_min,
+            "load_l": vd.load_l,
+            "trips": [
+                {
+                    "trip_index": tr.trip_index,
+                    "load_start_min": tr.load_start_min,
+                    "load_start": minutes_to_hhmm(tr.load_start_min),
+                    "depart_min": tr.depart_min,
+                    "depart": minutes_to_hhmm(tr.depart_min),
+                    "return_min": tr.return_min,
+                    "return": minutes_to_hhmm(tr.return_min),
+                    "drive_min": tr.drive_min,
+                    "load_l": tr.load_l,
+                    "capacity_l": tr.capacity_l,
+                    "utilization": round(tr.utilization, 3),
+                    "stops": [
+                        {
+                            "customer_id": s.customer_id,
+                            "customer_name": s.customer_name,
+                            "arrive_min": s.arrive_min,
+                            "arrive": minutes_to_hhmm(s.arrive_min),
+                            "depart_min": s.depart_min,
+                            "depart": minutes_to_hhmm(s.depart_min),
+                            "delivered_l": s.delivered_l,
+                            "window": (
+                                f"{minutes_to_hhmm(s.window_open_min)}-"
+                                f"{minutes_to_hhmm(s.window_close_min)}"
+                            ),
+                            "slack_min": s.slack_min,
+                        }
+                        for s in tr.stops
+                    ],
+                }
+                for tr in vd.trips
+            ],
+        }
+        for vd in vehicle_days
+    ]
+
+
 def _plan_to_dict(plan: Plan) -> dict:
     """計画をそのまま JSON にする。
 
@@ -183,56 +239,7 @@ def _plan_to_dict(plan: Plan) -> dict:
         "objective": plan.objective,
         "wall_time_s": round(plan.wall_time_s, 3),
         "total_drive_min": plan.total_drive_min,
-        "vehicle_days": [
-            {
-                "vehicle_id": vd.vehicle_id,
-                "vehicle_name": vd.vehicle_name,
-                "driver_id": vd.driver_id,
-                "driver_name": vd.driver_name,
-                "duty_start_min": vd.duty_start_min,
-                "duty_start": minutes_to_hhmm(vd.duty_start_min),
-                "duty_end_min": vd.duty_end_min,
-                "duty_end": minutes_to_hhmm(vd.duty_end_min),
-                "duty_min": vd.duty_min,
-                "drive_min": vd.drive_min,
-                "break_min": vd.break_min,
-                "load_l": vd.load_l,
-                "trips": [
-                    {
-                        "trip_index": tr.trip_index,
-                        "load_start_min": tr.load_start_min,
-                        "load_start": minutes_to_hhmm(tr.load_start_min),
-                        "depart_min": tr.depart_min,
-                        "depart": minutes_to_hhmm(tr.depart_min),
-                        "return_min": tr.return_min,
-                        "return": minutes_to_hhmm(tr.return_min),
-                        "drive_min": tr.drive_min,
-                        "load_l": tr.load_l,
-                        "capacity_l": tr.capacity_l,
-                        "utilization": round(tr.utilization, 3),
-                        "stops": [
-                            {
-                                "customer_id": s.customer_id,
-                                "customer_name": s.customer_name,
-                                "arrive_min": s.arrive_min,
-                                "arrive": minutes_to_hhmm(s.arrive_min),
-                                "depart_min": s.depart_min,
-                                "depart": minutes_to_hhmm(s.depart_min),
-                                "delivered_l": s.delivered_l,
-                                "window": (
-                                    f"{minutes_to_hhmm(s.window_open_min)}-"
-                                    f"{minutes_to_hhmm(s.window_close_min)}"
-                                ),
-                                "slack_min": s.slack_min,
-                            }
-                            for s in tr.stops
-                        ],
-                    }
-                    for tr in vd.trips
-                ],
-            }
-            for vd in plan.vehicle_days
-        ],
+        "vehicle_days": _vehicle_days_to_list(plan.vehicle_days),
         "unserved": [
             {
                 "customer_id": u.customer_id,
@@ -318,6 +325,110 @@ def make_plan(req: PlanRequest) -> dict:
     }
     body["elapsed_s"] = round(time.monotonic() - started, 3)
     return body
+
+
+class OrderIn(BaseModel):
+    """当日の発注1件。**証拠の残る形でしか受けない**（発注システムかFAX）。"""
+
+    customer_id: str
+    product: Product
+    volume_l: int = Field(gt=0)
+    source: str = Field(pattern="^(system|fax)$", description="system（発注システム）か fax。電話は不可")
+    evidence_ref: str = Field(min_length=1, description="伝票番号・FAX画像の保存先など")
+
+
+class ReplanRequest(PlanRequest):
+    """当日の組み直しの要求。朝の計画と同じ日の条件に、いまの時刻と発注を足す。"""
+
+    now: str = Field(pattern="^([01][0-9]|2[0-3]):[0-5][0-9]$", description="いまの時刻 HH:MM")
+    orders: list[OrderIn] = Field(min_length=1)
+    spot_standby: int = Field(default=0, ge=0, le=10, description="いま呼べる待機の非専属の台数")
+
+
+@app.post("/api/replan")
+def make_replan(req: ReplanRequest) -> dict:
+    """朝の計画に、当日の発注を差し込んで組み直す。
+
+    朝の計画は**再現モードで組み直す**。審査員が /api/plan で見た朝の計画と
+    必ず同じものを土台にするため（再現モードは同じ入力から同じ計画を返す）。
+    組み直しそのものは即応モード（時間で打ち切る）。
+    """
+    plan_id = uuid.uuid4().hex[:12]
+    started = time.monotonic()
+    try:
+        amount = ledger.reserve(req.subject, "solve")
+    except ledger.BudgetExceeded as exc:
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
+
+    try:
+        scenario = generate(
+            seed=req.seed,
+            date=req.date,
+            season=req.season,
+            absent_drivers=tuple(req.absent_drivers),
+            declined_customers=tuple(req.declined_customers),
+        )
+        orders = [
+            NewOrder(o.customer_id, o.product, o.volume_l, o.source, o.evidence_ref)
+            for o in req.orders
+        ]
+        base = solve(
+            scenario,
+            matrix=build_matrix(scenario.depot, scenario.customers),
+            workers=settings.solve_workers,
+            mode=SolveMode.REPRODUCIBLE,
+        )
+        hh, mm = req.now.split(":")
+        result = replan(
+            scenario,
+            base,
+            now_min=int(hh) * 60 + int(mm),
+            orders=orders,
+            spot_standby=req.spot_standby,
+            time_limit_s=settings.solve_time_limit_s,
+        )
+    except ValueError as exc:
+        ledger.release(req.subject, amount)
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        ledger.release(req.subject, amount)
+        logger.exception("組み直しに失敗")
+        raise HTTPException(status_code=500, detail="組み直せませんでした") from exc
+
+    ledger.record(
+        req.subject,
+        "solve",
+        amount,
+        plan_id=plan_id,
+        detail=f"replan seed={req.seed} now={req.now} orders={len(orders)} status={result.sub_plan.status}",
+    )
+    return {
+        "plan_id": plan_id,
+        "ok": result.ok,
+        "summary_ja": result.summary_ja(),
+        "text_ja": format_replan_ja(result),
+        "changes": list(result.changes),
+        "shortfalls": list(result.shortfalls),
+        "escapes": [
+            {"kind": e.kind, "customer_id": e.customer_id, "customer_name": e.customer_name,
+             "volume_l": e.volume_l}
+            for e in result.escapes
+        ],
+        "unfilled": [
+            {"customer_id": u.customer_id, "customer_name": u.customer_name, "demand_l": u.demand_l}
+            for u in result.unfilled
+        ],
+        "spot_called": list(result.spot_called),
+        "frozen_trip_count": len(result.frozen_trips),
+        "vehicle_days": _vehicle_days_to_list(result.vehicle_days),
+        "base_summary_ja": base.summary_ja(),
+        "diagnostics": {
+            "base_reproducible": base.diagnostics.get("reproducible"),
+            "replan_status": result.sub_plan.status,
+            "replan_mode": result.sub_plan.diagnostics.get("solve_mode"),
+        },
+        "elapsed_s": round(time.monotonic() - started, 3),
+    }
 
 
 @app.get("/api/scenario")

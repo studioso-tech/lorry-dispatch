@@ -201,3 +201,58 @@ def test_declined_customers_are_accepted_and_validated():
 
     bad = client.post("/api/plan", json={"declined_customers": ["c99"], "mode": "fast"})
     assert bad.status_code == 400
+
+
+# ---------------------------------------------------------------------------
+# 当日の組み直し
+# ---------------------------------------------------------------------------
+
+
+def _free_customer(seed=20261016, date="2026-10-16"):
+    """朝の計画に無く、今日受けられる先（当日発注を入れる相手）。"""
+    from core.generator import generate
+    from core.solver import SolveMode, solve
+    from core.travel import build_matrix
+
+    s = generate(seed=seed, date=date, season="winter")
+    base = solve(s, matrix=build_matrix(s.depot, s.customers), mode=SolveMode.REPRODUCIBLE)
+    served = {st.customer_id for t in base.trips for st in t.stops}
+    c = next(c for c in s.customers if c.id not in served and c.open_today)
+    t = max(c.tanks, key=lambda t: t.topup_l)
+    return c.id, t.product.value, min(4_000, t.topup_l)
+
+
+def test_replan_inserts_an_order_with_its_evidence():
+    """FAXの発注を差し込むと、どの車で何時に着くかが証拠つきで返る。"""
+    cid, product, vol = _free_customer()
+    r = client.post("/api/replan", json={
+        "seed": 20261016, "date": "2026-10-16", "now": "09:00",
+        "orders": [{"customer_id": cid, "product": product, "volume_l": vol,
+                    "source": "fax", "evidence_ref": "FAX-API-001"}],
+    })
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["ok"]
+    assert any("FAX-API-001" in c for c in body["changes"])
+    assert "組み直し" in body["text_ja"]
+    # 朝の計画は再現モードで組み直している（/api/plan と同じ土台）
+    assert body["diagnostics"]["base_reproducible"] is True
+
+
+def test_replan_refuses_phone_orders():
+    """電話は発注ではない。証拠の残る形（発注システムかFAX）でしか受けない。"""
+    r = client.post("/api/replan", json={
+        "now": "09:00",
+        "orders": [{"customer_id": "c01", "product": "regular", "volume_l": 4000,
+                    "source": "phone", "evidence_ref": "電話 9:00"}],
+    })
+    assert r.status_code == 422
+
+
+def test_replan_rejects_unknown_customer():
+    r = client.post("/api/replan", json={
+        "now": "09:00",
+        "orders": [{"customer_id": "c99", "product": "regular", "volume_l": 4000,
+                    "source": "system", "evidence_ref": "ORD-1"}],
+    })
+    assert r.status_code == 400
