@@ -152,7 +152,7 @@ def test_standby_never_drops_below_the_utilization_floor():
     車両の維持費、減価償却（1台2,000万円）、乗務員の確保を考えると、
     5割前後では運送会社は持たない。
     """
-    from core.fleet_plan import MIN_STANDBY_UTILIZATION, fleet_options
+    from core.fleet_plan import MIN_STANDBY_UTILIZATION, OTHER_BUSINESS_SHARE, fleet_options
 
     rng = random.Random(2)
     for _ in range(100):
@@ -160,7 +160,8 @@ def test_standby_never_drops_below_the_utilization_floor():
         daily = [max(0, base + rng.randint(-5, 5)) for _ in range(42)]
         for o in fleet_options(daily):
             if o.standby:
-                assert o.utilization >= MIN_STANDBY_UTILIZATION - 1e-9
+                # こちらから呼ぶ分 ＋ 系列外の仕事 で70%以上
+                assert o.utilization + OTHER_BUSINESS_SHARE >= MIN_STANDBY_UTILIZATION - 1e-9
 
 
 def test_breakdown_alone_does_not_justify_a_standby_vehicle():
@@ -171,7 +172,8 @@ def test_breakdown_alone_does_not_justify_a_standby_vehicle():
     """
     from core.fleet_plan import fleet_options
 
-    steady = fleet_options([20] * 42)
+    # 系列外の仕事が無ければ、故障だけのための待機は成り立たない
+    steady = fleet_options([20] * 42, other_share=0.0)
     assert steady[20].standby == 0
 
 
@@ -199,3 +201,19 @@ def test_recommend_avoids_chronic_reliance_on_escape_routes():
     assert not r.chronic
     cheaper = [o for o in opts if o.cost < r.cost]
     assert all(o.chronic for o in cheaper)
+
+
+
+def test_non_affiliate_work_makes_standby_viable():
+    """系列外の仕事で稼げれば、非専属を待機させる案が成り立つ（実務）。
+
+    ノーマーク（元売の看板を付けない）の非専属は、系列以外の仕事もできる。
+    専属は看板を背負っているので系列の仕事しかできない。
+    """
+    from core.fleet_plan import fleet_options, recommend
+
+    daily = [16] * 20 + [18] * 15 + [20] * 7
+    without = recommend(fleet_options(daily, other_share=0.0))
+    with_other = recommend(fleet_options(daily, other_share=0.5))
+    assert with_other.standby >= without.standby
+    assert with_other.cost <= without.cost

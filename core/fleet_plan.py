@@ -186,6 +186,17 @@ MIN_STANDBY_UTILIZATION = 0.70
 #: できない（整備会社も日曜は休みが多い）。冬に抜けるのは予測できない故障だけ。
 BREAKDOWN_RATE_WINTER = 0.01
 
+#: 待機の非専属が、系列以外の仕事で埋めている割合。**仮置。**
+#:
+#: 運送会社は**ノーマーク**（元売の看板を付けない）の非専属を抱えて、系列以外の
+#: 商売を一定の割合でする（実務）。専属は元売の看板を背負っているので系列の
+#: 仕事しかできないが、ノーマークの車は他社や他の荷主の仕事も取れる。だから
+#: 呼ばれない日も稼げて、稼働率70%を保てる。
+#:
+#: 冬の半期の結果は、この割合が30%から50%まで変わらなかった（専属18台＋非専属2台、
+#: 融通しない場合）。正確な値を知らなくても結論は動かない。
+OTHER_BUSINESS_SHARE = 0.30
+
 #: 逃げ道（計画配送を1日ずらす、拘束を延ばす等）に頼ってよい日の割合の目安。
 #: **仮置。** 一時的なら可、恒常的なら構造の欠陥（実務）。これを超える案は
 #: 「恒常化の恐れ」として印を付ける。
@@ -199,7 +210,8 @@ class FleetOption:
     Attributes:
         dedicated: 専属の台数。
         standby: 運送会社が待機させる非専属の台数（稼働率の下限を守れる最大）。
-        utilization: 待機の稼働率。**運送会社が成り立つかの目安。**
+        utilization: 待機の非専属が、**こちらから呼ばれて**動く割合。系列外の
+            仕事（other_share）と合わせて稼働率の下限を満たせば運送会社は成り立つ。
         spot_vehicle_days: 非専属が実際に呼ばれた延べ台日。
         escape_days: 専属＋待機でも足りず、逃げ道に頼る日数。
         escape_vehicle_days: 逃げ道で吸収する延べ台日。
@@ -223,6 +235,7 @@ def fleet_options(
     premium: float = SPOT_PREMIUM,
     breakdown: float = BREAKDOWN_RATE_WINTER,
     min_utilization: float = MIN_STANDBY_UTILIZATION,
+    other_share: float = OTHER_BUSINESS_SHARE,
     spot_cap_ratio: float = SPOT_CAP_RATIO,
     escape_tolerance: float = ESCAPE_TOLERANCE,
 ) -> list[FleetOption]:
@@ -236,7 +249,12 @@ def fleet_options(
     「故障の穴埋め breakdown·min(d, N)」。運送会社は、稼働率が下限を割らない
     範囲で、かつ規模の上限（spot_cap_ratio）の中で、できるだけ多く待機させる。
     それでも足りない分は逃げ道に頼る。
+
+    稼働率は「こちらから呼ぶ分 ＋ 系列外の仕事（other_share）」で見る。系列外の
+    仕事は、こちらが呼ばない日の空きを埋めるものとし、呼びたい日に取られている
+    ことは無いとした（楽観側の近似）。
     """
+    floor = max(0.0, min_utilization - other_share)
     if not daily_need:
         raise ValueError("評価する日が無い")
     days = len(daily_need)
@@ -248,7 +266,7 @@ def fleet_options(
         standby = 0
         for s in range(cap, 0, -1):
             used = sum(min(x, s) for x in need)
-            if used / (s * days) >= min_utilization:
+            if used / (s * days) >= floor:
                 standby = s
                 break
         used = sum(min(x, standby) for x in need)

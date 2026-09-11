@@ -43,6 +43,7 @@ from core.fleet_plan import (  # noqa: E402
     BREAKDOWN_RATE_WINTER,
     ESCAPE_TOLERANCE,
     MIN_STANDBY_UTILIZATION,
+    OTHER_BUSINESS_SHARE,
     SPOT_PREMIUM,
     fleet_options,
     recommend,
@@ -170,9 +171,10 @@ def _report(label: str, daily: list[int]) -> None:
     print()
     print(f"【専属の台数ごとの損得 — {label}】 必要台数のピーク {max(daily)}台")
     print(f"  前提: 冬に抜けるのは故障だけ（{BREAKDOWN_RATE_WINTER:.0%}、点検は夏に入れる）、"
-          f"待機の非専属は稼働率{MIN_STANDBY_UTILIZATION:.0%}以上、"
+          f"待機の非専属は稼働率{MIN_STANDBY_UTILIZATION:.0%}以上"
+          f"（うち系列外の仕事{OTHER_BUSINESS_SHARE:.0%}）、"
           f"逃げ道は半期の{ESCAPE_TOLERANCE:.0%}まで")
-    print(f"  {'専属':>4} {'待機の非専属':>10} {'稼働率':>6} {'逃げ道に頼る日':>12} {'元売の運賃':>9}")
+    print(f"  {'専属':>4} {'待機の非専属':>10} {'呼ばれる割合':>8} {'逃げ道に頼る日':>12} {'元売の運賃':>9}")
     lo = max(0, min(r.dedicated, cost_only) - 1)
     for o in opts[lo:]:
         mark = " ← 推奨" if o is r else ("  恒常化の恐れ" if o.chronic else "")
