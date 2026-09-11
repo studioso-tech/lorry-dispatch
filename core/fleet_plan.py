@@ -169,3 +169,114 @@ def split_fleet(
         cost=cost,
         cost_all_dedicated=cost_peak,
     )
+
+
+# ---------------------------------------------------------------------------
+# 運送会社が成り立つ配分（2026-09-12）
+# ---------------------------------------------------------------------------
+
+#: 待機させる非専属の稼働率の下限。**車両の維持費、減価償却（1台2,000万円）、
+#: 乗務員の確保を考えると70%前後は要る。5割前後では運送会社は持たない。**（実務）
+MIN_STANDBY_UTILIZATION = 0.70
+
+#: 冬の半期に専属が**故障で**抜ける割合。**仮置。**
+#:
+#: 計画的な点検は冬には入れない。購入したローリーは廃車まで手放せないので、
+#: 点検は需要の少ない夏の半期（4〜9月）にまとめる（実務）。日曜に寄せることも
+#: できない（整備会社も日曜は休みが多い）。冬に抜けるのは予測できない故障だけ。
+BREAKDOWN_RATE_WINTER = 0.01
+
+#: 逃げ道（計画配送を1日ずらす、拘束を延ばす等）に頼ってよい日の割合の目安。
+#: **仮置。** 一時的なら可、恒常的なら構造の欠陥（実務）。これを超える案は
+#: 「恒常化の恐れ」として印を付ける。
+ESCAPE_TOLERANCE = 0.05
+
+
+@dataclass(frozen=True)
+class FleetOption:
+    """専属の台数を1つ決めたときの、元売と運送会社それぞれの損得。
+
+    Attributes:
+        dedicated: 専属の台数。
+        standby: 運送会社が待機させる非専属の台数（稼働率の下限を守れる最大）。
+        utilization: 待機の稼働率。**運送会社が成り立つかの目安。**
+        spot_vehicle_days: 非専属が実際に呼ばれた延べ台日。
+        escape_days: 専属＋待機でも足りず、逃げ道に頼る日数。
+        escape_vehicle_days: 逃げ道で吸収する延べ台日。
+        cost: 元売の運賃（専属1台1日＝1、非専属は割増込み）。
+        chronic: 逃げ道に頼る日が目安（ESCAPE_TOLERANCE）を超える＝恒常化の恐れ。
+    """
+
+    dedicated: int
+    standby: int
+    utilization: float
+    spot_vehicle_days: float
+    escape_days: int
+    escape_vehicle_days: float
+    cost: float
+    chronic: bool
+
+
+def fleet_options(
+    daily_need: list[int],
+    *,
+    premium: float = SPOT_PREMIUM,
+    breakdown: float = BREAKDOWN_RATE_WINTER,
+    min_utilization: float = MIN_STANDBY_UTILIZATION,
+    spot_cap_ratio: float = SPOT_CAP_RATIO,
+    escape_tolerance: float = ESCAPE_TOLERANCE,
+) -> list[FleetOption]:
+    """専属の台数ごとに、両者の損得を並べる。**答えを1つに決め打ちしない。**
+
+    どこで釣り合わせるかは元売と運送会社の間の判断で、道具はその材料を
+    並べる側に回る。払う側の費用だけで決めた答え（split_fleet の
+    dedicated_cost_only）は、運送会社に待機の費用を寄せた答えだった。
+
+    専属 N 台のとき、各日に非専属が要る量は「需要の振れ max(0, d−N)」＋
+    「故障の穴埋め breakdown·min(d, N)」。運送会社は、稼働率が下限を割らない
+    範囲で、かつ規模の上限（spot_cap_ratio）の中で、できるだけ多く待機させる。
+    それでも足りない分は逃げ道に頼る。
+    """
+    if not daily_need:
+        raise ValueError("評価する日が無い")
+    days = len(daily_need)
+    peak = max(daily_need)
+    out: list[FleetOption] = []
+    for n in range(0, peak + 1):
+        need = [max(0, d - n) + breakdown * min(d, n) for d in daily_need]
+        cap = spot_cap_for(n, spot_cap_ratio) if not math.isinf(spot_cap_ratio) else peak
+        standby = 0
+        for s in range(cap, 0, -1):
+            used = sum(min(x, s) for x in need)
+            if used / (s * days) >= min_utilization:
+                standby = s
+                break
+        used = sum(min(x, standby) for x in need)
+        short = [x - standby for x in need]
+        escape_days = sum(1 for x in short if x >= 0.5)
+        out.append(
+            FleetOption(
+                dedicated=n,
+                standby=standby,
+                utilization=used / (standby * days) if standby else 0.0,
+                spot_vehicle_days=used,
+                escape_days=escape_days,
+                escape_vehicle_days=sum(max(0.0, x) for x in short),
+                cost=n * days + (1.0 + premium) * used,
+                chronic=escape_days > escape_tolerance * days,
+            )
+        )
+    return out
+
+
+def recommend(options: list[FleetOption]) -> FleetOption:
+    """恒常化の恐れが無い案のうち、元売の運賃が最小のもの。
+
+    無ければ（どの台数でも逃げ道に頼りすぎる）、逃げ道の日数が最小の案。
+    その場合は**専属を増やしても解けない＝需要か配送圏の見直しが要る**という
+    ことなので、呼び出し側はそのまま伝えること。
+    """
+    ok = [o for o in options if not o.chronic]
+    if ok:
+        return min(ok, key=lambda o: (o.cost, o.dedicated))
+    return min(options, key=lambda o: (o.escape_days, o.cost))

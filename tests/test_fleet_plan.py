@@ -139,3 +139,63 @@ def test_invalid_shares_are_rejected():
         DemandChain(eneos_share=1.5)
     with pytest.raises(ValueError):
         DemandChain(allocation=0)
+
+
+# ---------------------------------------------------------------------------
+# 運送会社が成り立つ配分
+# ---------------------------------------------------------------------------
+
+
+def test_standby_never_drops_below_the_utilization_floor():
+    """待機させる非専属は、稼働率70%を割らない台数まで（実務）。
+
+    車両の維持費、減価償却（1台2,000万円）、乗務員の確保を考えると、
+    5割前後では運送会社は持たない。
+    """
+    from core.fleet_plan import MIN_STANDBY_UTILIZATION, fleet_options
+
+    rng = random.Random(2)
+    for _ in range(100):
+        base = rng.randint(8, 22)
+        daily = [max(0, base + rng.randint(-5, 5)) for _ in range(42)]
+        for o in fleet_options(daily):
+            if o.standby:
+                assert o.utilization >= MIN_STANDBY_UTILIZATION - 1e-9
+
+
+def test_breakdown_alone_does_not_justify_a_standby_vehicle():
+    """故障だけに備えた待機は成り立たない。
+
+    故障1%なら専属20台で1日平均0.2台。1台待機させても出番は5日に1日で、
+    稼働率70%に届かない。
+    """
+    from core.fleet_plan import fleet_options
+
+    steady = fleet_options([20] * 42)
+    assert steady[20].standby == 0
+
+
+def test_enough_dedicated_leaves_no_escape_days():
+    """ピークまで専属で持てば、逃げ道に頼る日は無い。"""
+    from core.fleet_plan import fleet_options
+
+    daily = [14] * 20 + [18] * 15 + [21] * 7
+    opts = fleet_options(daily)
+    assert opts[max(daily)].escape_days == 0
+    assert opts[14].escape_days > 0 and opts[14].chronic
+
+
+def test_recommend_avoids_chronic_reliance_on_escape_routes():
+    """推奨は「恒常化の恐れが無い案」の中で元売の運賃が最小のもの。
+
+    逃げ道（計画配送を1日ずらす、拘束を延ばす）は一時的なら可、恒常的なら
+    構造の欠陥（実務）。運賃が安くても、逃げ道に恒常的に頼る案は選ばない。
+    """
+    from core.fleet_plan import fleet_options, recommend
+
+    daily = [14] * 20 + [18] * 15 + [21] * 7
+    opts = fleet_options(daily)
+    r = recommend(opts)
+    assert not r.chronic
+    cheaper = [o for o in opts if o.cost < r.cost]
+    assert all(o.chronic for o in cheaper)

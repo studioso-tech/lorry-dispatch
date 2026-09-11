@@ -39,7 +39,15 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from core.demand_chain import HALF_YEAR_MONTHS, DemandChain, zone_kl_per_day, zones_for  # noqa: E402
-from core.fleet_plan import SPOT_CAP_RATIO, SPOT_PREMIUM, UNAVAILABILITY, split_fleet  # noqa: E402
+from core.fleet_plan import (  # noqa: E402
+    BREAKDOWN_RATE_WINTER,
+    ESCAPE_TOLERANCE,
+    MIN_STANDBY_UTILIZATION,
+    SPOT_PREMIUM,
+    fleet_options,
+    recommend,
+    split_fleet,
+)
 from core.generator import EPOCH, generate  # noqa: E402
 from core.solver import solve  # noqa: E402
 from core.travel import build_matrix  # noqa: E402
@@ -155,21 +163,25 @@ def main() -> int:
 
 
 def _report(label: str, daily: list[int]) -> None:
-    r = split_fleet(daily)
+    """専属の台数ごとに、元売と運送会社それぞれの損得を並べる。"""
+    opts = fleet_options(daily)
+    r = recommend(opts)
+    cost_only = split_fleet(daily).dedicated_cost_only
     print()
-    print(f"【専属と非専属の配分 — {label}】")
-    print(f"  前提: 非専属は専属の{1 + SPOT_PREMIUM:.2f}倍の単価、専属が抜ける割合 {UNAVAILABILITY:.0%}、"
-          f"非専属を呼べるのは専属の{SPOT_CAP_RATIO:.0%}まで")
-    print(f"  必要台数のピーク {max(daily)}台")
-    print(f"  払う側の費用だけで決めると   専属 {r.dedicated_cost_only}台"
-          f"（半期の{r.threshold:.0%}を超える日に要る車だけ専属。振れは全部非専属へ）")
-    print(f"  **非専属の上限を守ると       専属 {r.dedicated}台 ＋ 非専属 最大{r.spot_cap}台**")
-    print(f"  非専属の延べ  需要の振れ {r.spot_days_swing}台日 ＋ 専属が抜けた日の穴埋め"
-          f" {r.spot_days_cover:.0f}台日（{r.days}日間）")
-    print(f"  運送会社が待機させる非専属 {r.spot_cap}台のうち、実際に呼ばれる割合 **{r.standby_utilization:.0%}**"
-          "（残りは運送会社が待機の費用を被る）")
-    saving = 1 - r.cost / r.cost_all_dedicated
-    print(f"  運賃  ピーク{max(daily)}台を全部専属で持つ場合より {saving:.1%} 安い")
+    print(f"【専属の台数ごとの損得 — {label}】 必要台数のピーク {max(daily)}台")
+    print(f"  前提: 冬に抜けるのは故障だけ（{BREAKDOWN_RATE_WINTER:.0%}、点検は夏に入れる）、"
+          f"待機の非専属は稼働率{MIN_STANDBY_UTILIZATION:.0%}以上、"
+          f"逃げ道は半期の{ESCAPE_TOLERANCE:.0%}まで")
+    print(f"  {'専属':>4} {'待機の非専属':>10} {'稼働率':>6} {'逃げ道に頼る日':>12} {'元売の運賃':>9}")
+    lo = max(0, min(r.dedicated, cost_only) - 1)
+    for o in opts[lo:]:
+        mark = " ← 推奨" if o is r else ("  恒常化の恐れ" if o.chronic else "")
+        util = f"{o.utilization:.0%}" if o.standby else "—"
+        print(f"  {o.dedicated:>4}台 {o.standby:>8}台 {util:>6} {o.escape_days:>8}日/{len(daily)}日"
+              f" {o.cost / r.cost:>8.1%}{mark}")
+    print(f"  払う側の費用だけで決めた答えは専属{cost_only}台（非専属を無制限に呼べる前提）。")
+    if r.chronic:
+        print("  **どの台数でも逃げ道に頼りすぎる。専属を増やしても解けない＝需要か配送圏の見直しが要る。**")
 
 
 if __name__ == "__main__":
