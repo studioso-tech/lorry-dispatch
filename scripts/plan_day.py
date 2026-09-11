@@ -21,7 +21,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from core.domain import minutes_to_hhmm  # noqa: E402
 from core.generator import generate  # noqa: E402
-from core.solver import DEFAULT_TIME_LIMIT_S, format_plan_ja, solve  # noqa: E402
+from core.solver import DEFAULT_TIME_LIMIT_S, SolveMode, format_plan_ja, solve  # noqa: E402
 from core.travel import build_matrix  # noqa: E402
 
 
@@ -35,7 +35,14 @@ def main() -> int:
     ap.add_argument(
         "--absent", action="append", default=[], help="欠勤する乗務員ID（例 d1）"
     )
-    ap.add_argument("--time-limit", type=float, default=DEFAULT_TIME_LIMIT_S)
+    ap.add_argument(
+        "--fast",
+        action="store_true",
+        help="実時間で打ち切る（--time-limit 秒）。既定は再現モード"
+        "（どのマシンでも同じ計画が返る。時間は1〜2分かかることがある）",
+    )
+    ap.add_argument("--time-limit", type=float, default=DEFAULT_TIME_LIMIT_S,
+                    help="--fast のときだけ効く")
     ap.add_argument("--verbose", action="store_true", help="需要と車両の内訳も出す")
     args = ap.parse_args()
 
@@ -65,7 +72,12 @@ def main() -> int:
         )
         print(f"  出せる車 {len(scenario.usable_vehicles())}台\n")
 
-    plan = solve(scenario, matrix=matrix, time_limit_s=args.time_limit)
+    plan = solve(
+        scenario,
+        matrix=matrix,
+        time_limit_s=args.time_limit,
+        mode=SolveMode.FAST if args.fast else SolveMode.REPRODUCIBLE,
+    )
     print(format_plan_ja(plan))
     print()
     print(
