@@ -39,7 +39,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from core.demand_chain import HALF_YEAR_MONTHS, DemandChain, zone_kl_per_day, zones_for  # noqa: E402
-from core.fleet_plan import SPOT_PREMIUM, UNAVAILABILITY, split_fleet  # noqa: E402
+from core.fleet_plan import SPOT_CAP_RATIO, SPOT_PREMIUM, UNAVAILABILITY, split_fleet  # noqa: E402
 from core.generator import EPOCH, generate  # noqa: E402
 from core.solver import solve  # noqa: E402
 from core.travel import build_matrix  # noqa: E402
@@ -156,20 +156,20 @@ def main() -> int:
 
 def _report(label: str, daily: list[int]) -> None:
     r = split_fleet(daily)
-    print(f"\n【専属と非専属の配分 — {label}】（非専属は専属の{1 + SPOT_PREMIUM:.2f}倍の単価、"
-          f"専属が抜ける割合 {UNAVAILABILITY:.0%}）")
-    print(f"  専属にする境目: 半期のうち **{r.threshold:.0%}** を超える日に要る車")
-    first_spot = r.dedicated
-    lo = max(0, first_spot - 3)
-    for k in range(lo, len(r.need_share)):
-        mark = "専属" if k < r.dedicated else "非専属"
-        print(f"    {k + 1:>3}台目  要る日 {r.need_share[k]:5.0%}  → {mark}")
-    print(f"\n  **専属 {r.dedicated}台**")
-    print(f"  非専属  需要の振れ {r.spot_days_swing}台日 ＋ 抜けた日の穴埋め"
+    print()
+    print(f"【専属と非専属の配分 — {label}】")
+    print(f"  前提: 非専属は専属の{1 + SPOT_PREMIUM:.2f}倍の単価、専属が抜ける割合 {UNAVAILABILITY:.0%}、"
+          f"非専属を呼べるのは専属の{SPOT_CAP_RATIO:.0%}まで")
+    print(f"  必要台数のピーク {max(daily)}台")
+    print(f"  払う側の費用だけで決めると   専属 {r.dedicated_cost_only}台"
+          f"（半期の{r.threshold:.0%}を超える日に要る車だけ専属。振れは全部非専属へ）")
+    print(f"  **非専属の上限を守ると       専属 {r.dedicated}台 ＋ 非専属 最大{r.spot_cap}台**")
+    print(f"  非専属の延べ  需要の振れ {r.spot_days_swing}台日 ＋ 専属が抜けた日の穴埋め"
           f" {r.spot_days_cover:.0f}台日（{r.days}日間）")
-    print(f"          1日に最大 {r.spot_peak}台")
+    print(f"  運送会社が待機させる非専属 {r.spot_cap}台のうち、実際に呼ばれる割合 **{r.standby_utilization:.0%}**"
+          "（残りは運送会社が待機の費用を被る）")
     saving = 1 - r.cost / r.cost_all_dedicated
-    print(f"  費用  ピーク{max(daily)}台を全部専属で持つ場合より {saving:.1%} 安い")
+    print(f"  運賃  ピーク{max(daily)}台を全部専属で持つ場合より {saving:.1%} 安い")
 
 
 if __name__ == "__main__":

@@ -7,12 +7,13 @@
 
 from __future__ import annotations
 
+import math
 import random
 
 import pytest
 
 from core.demand_chain import DemandChain, zone_kl_per_day, zones_for
-from core.fleet_plan import SPOT_PREMIUM, UNAVAILABILITY, split_fleet
+from core.fleet_plan import SPOT_PREMIUM, UNAVAILABILITY, spot_cap_for, split_fleet
 
 
 def _brute_force(daily, premium=SPOT_PREMIUM, unavailability=UNAVAILABILITY):
@@ -26,13 +27,62 @@ def _brute_force(daily, premium=SPOT_PREMIUM, unavailability=UNAVAILABILITY):
     return min(range(max(daily) + 1), key=lambda n: (cost(n), n))
 
 
-def test_split_matches_brute_force():
-    """「要る日の割合が境目を超えたら専属」が、費用の総当たりと一致すること。"""
+def test_cost_only_rule_matches_brute_force():
+    """上限なしなら「要る日の割合が境目を超えたら専属」が、費用の総当たりと一致する。"""
     rng = random.Random(0)
     for _ in range(200):
         base = rng.randint(5, 25)
         daily = [max(0, base + rng.randint(-4, 6)) for _ in range(rng.randint(20, 60))]
-        assert split_fleet(daily).dedicated == _brute_force(daily), daily
+        r = split_fleet(daily, spot_cap_ratio=math.inf)
+        assert r.dedicated == r.dedicated_cost_only == _brute_force(daily), daily
+
+
+def test_capped_split_is_the_cheapest_that_respects_the_cap():
+    """上限ありでは、「非専属の上限を守れる台数」の中で費用最小を選ぶ。
+
+    **払う側の費用だけで決めてはいけない。** 非専属を呼べるようにしておくには
+    運送会社が車と乗務員を待機させる必要があり、呼ばれない日の費用は運送会社が
+    被る。上限を超える振れは専属で持つ。
+    """
+    rng = random.Random(1)
+    for _ in range(200):
+        base = rng.randint(8, 25)
+        daily = [max(0, base + rng.randint(-5, 6)) for _ in range(rng.randint(20, 60))]
+        r = split_fleet(daily)
+        # 上限を守っている
+        assert r.spot_peak <= r.spot_cap or r.dedicated == max(daily)
+        # 上限を守れる台数の中で費用最小（総当たり）
+        days = len(daily)
+
+        def cost(n):
+            swing = sum(max(0, d - n) for d in daily)
+            cover = UNAVAILABILITY * sum(min(d, n) for d in daily)
+            return n * days + (1 + SPOT_PREMIUM) * (swing + cover)
+
+        def ok(n):
+            peak = max(max(0, d - n) for d in daily) + math.ceil(UNAVAILABILITY * n)
+            return peak <= spot_cap_for(n)
+
+        feasible = [n for n in range(max(daily) + 1) if ok(n)] or [max(daily)]
+        assert r.dedicated == min(feasible, key=lambda n: (cost(n), n)), daily
+        # 上限があれば、専属は上限なしの答え以上になる
+        assert r.dedicated >= r.dedicated_cost_only
+
+
+def test_twenty_dedicated_can_call_only_a_few_spot():
+    """専属20台なら、呼べる非専属は数台以下（実務）。"""
+    assert 1 <= spot_cap_for(20) <= 4
+
+
+def test_standby_utilization_shows_the_carriers_burden():
+    """運送会社が待機させる非専属のうち、実際に呼ばれる割合を出す。
+
+    需要が毎日同じでも、専属が抜ける日の穴埋めのために待機は要る。そのとき
+    待機の大半は呼ばれない＝運送会社が費用を被っている。
+    """
+    steady = split_fleet([20] * 100)
+    swingy = split_fleet([16] * 50 + [20] * 50)
+    assert 0 < steady.standby_utilization < swingy.standby_utilization <= 1
 
 
 def test_threshold_follows_the_premium():
