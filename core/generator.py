@@ -45,7 +45,9 @@ from core.domain import (
     Vehicle,
     VehicleClass,
     hhmm_to_minutes,
+    unload_minutes,
 )
+from core.travel import leg_minutes
 
 # ---------------------------------------------------------------------------
 # 油槽所
@@ -345,12 +347,30 @@ def _planned_daily(spec: CustomerSpec, season: str) -> dict[Product, int]:
     }
 
 
+def _work_minutes(spec: CustomerSpec, season: str) -> int:
+    """計画配送1回が車の時間をどれだけ食うか（分）。
+
+    油槽所との往復 ＋ 荷卸し ＋ 積込。**曜日を均すときの重さはこれ。**
+    """
+    daily = _planned_daily(spec, season)
+    drop = {p: v * PLANNED_INTERVAL_DAYS for p, v in daily.items() if v > 0}
+    one_way = leg_minutes(MARIFU.lat, MARIFU.lon, spec.lat, spec.lon)
+    unload = unload_minutes(drop, min(HOSE_INCH, spec.piping_inch))
+    return 2 * one_way + unload + MARIFU.load_min
+
+
 def _phases(season: str) -> dict[str, int]:
     """計画配送の先ごとに、周期の起点をどこに置くか。
 
-    **日々の合計がならされるように割り付ける。** 3日周期の先を全部同じ日に
-    置くと、その日だけ3倍になる。消費の大きい先から順に、いちばん軽い
-    起点へ入れていく（大きいものから詰める均し方）。
+    **日々の車の時間がならされるように割り付ける。** 3日周期の先を全部同じ
+    日に置くと、その日だけ3倍になる。重い先から順に、いちばん軽い起点へ
+    入れていく（大きいものから詰める均し方）。
+
+    **重さは量ではなく車の時間**（往復＋荷卸し＋積込、_work_minutes）。
+    最初は量で均していたが、秋に灯油が減って量の順番が入れ替わり、浜田と
+    益田（どちらも片道2時間半の山陰）が同じ日に割り付けられた。1台で1日に
+    両方は回れないので、需要の少ない秋の日曜に冬の平日と同じ台数が要る、
+    という答えが出た。縛っているのは量ではなく時間なので、時間で均す。
 
     日曜休業の先と毎日営業の先は、営業日の数え方が違う（6日と7日）ので、
     別々に均す。休業の先は営業日6日÷3日＝週2回で、曜日が固定される
@@ -362,12 +382,12 @@ def _phases(season: str) -> dict[str, int]:
             spec for spec in ROSTER
             if not spec.ordering and CLOSED_ON_SUNDAY[spec.type] == closed
         ]
-        group.sort(key=lambda spec: (-sum(_planned_daily(spec, season).values()), spec.id))
+        group.sort(key=lambda spec: (-_work_minutes(spec, season), spec.id))
         load = [0] * PLANNED_INTERVAL_DAYS
         for spec in group:
             k = min(range(PLANNED_INTERVAL_DAYS), key=lambda i: (load[i], i))
             phases[spec.id] = k
-            load[k] += sum(_planned_daily(spec, season).values())
+            load[k] += _work_minutes(spec, season)
     return phases
 
 

@@ -226,6 +226,26 @@ class TravelMatrix:
         return cls.from_json(path.read_text(encoding="utf-8"))
 
 
+def _leg(lat1: float, lon1: float, lat2: float, lon2: float) -> tuple[int, float, LegClass]:
+    """1区間の (所要分, 道路距離km, 区分)。build_matrix と leg_minutes が共有する。"""
+    straight = haversine_km(lat1, lon1, lat2, lon2)
+    leg = classify_leg(lat1, lon1, lat2, lon2, straight)
+    road_km = straight * winding_for(lat1, lon1, lat2, lon2)
+    base_min = road_km / SPEED_KMH[leg] * 60.0
+    if leg is LegClass.EXPRESSWAY:
+        base_min += EXPRESSWAY_ACCESS_MIN
+    return max(1, int(round(base_min))), road_km, leg
+
+
+def leg_minutes(lat1: float, lon1: float, lat2: float, lon2: float) -> int:
+    """2点間の自由流の所要時間（分）。行列を組まずに1区間だけ知りたいとき用。
+
+    生成器が計画配送の曜日を割り付けるとき、「その先に行くと車の時間を
+    どれだけ食うか」を見るのに使う。
+    """
+    return _leg(lat1, lon1, lat2, lon2)[0]
+
+
 def build_matrix(depot: Depot, customers: Sequence[Customer]) -> TravelMatrix:
     """幾何モデルで所要時間行列を組む（v0）。
 
@@ -246,15 +266,7 @@ def build_matrix(depot: Depot, customers: Sequence[Customer]) -> TravelMatrix:
         for j in range(n):
             if i == j:
                 continue
-            straight = haversine_km(lats[i], lons[i], lats[j], lons[j])
-            leg = classify_leg(lats[i], lons[i], lats[j], lons[j], straight)
-            road_km = straight * winding_for(lats[i], lons[i], lats[j], lons[j])
-            base_min = road_km / SPEED_KMH[leg] * 60.0
-            if leg is LegClass.EXPRESSWAY:
-                base_min += EXPRESSWAY_ACCESS_MIN
-            minutes[i][j] = max(1, int(round(base_min)))
-            kms[i][j] = road_km
-            classes[i][j] = leg
+            minutes[i][j], kms[i][j], classes[i][j] = _leg(lats[i], lons[i], lats[j], lons[j])
 
     return TravelMatrix(
         labels=labels,

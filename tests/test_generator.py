@@ -311,12 +311,14 @@ def test_unload_time_depends_on_volume():
 
     以前は類型ごとの定数で、2kL置くのも16kL置くのも同じ35分だった。
     """
-    s = generate(seed=20261015, season="winter")
-    by_type: dict = {}
-    for c in s.customers:
-        if c.demand_l:
-            by_type.setdefault((c.type, c.bore_inch), set()).add(c.service_min)
-    assert any(len(v) > 1 for v in by_type.values()), "同じ類型・口径で荷卸時間がすべて同じ"
+    from dataclasses import replace
+
+    c = next(x for x in generate(seed=20261015, season="winter").customers if x.open_today)
+    t = max(c.tanks, key=lambda t: t.topup_l)
+    small = replace(c, orders=(), planned=((t.product, 2_000),))
+    large = replace(c, orders=(), planned=((t.product, min(12_000, t.topup_l)),))
+    assert small.demand_l < large.demand_l
+    assert small.service_min < large.service_min
 
 
 def test_compartments_obey_hazmat_law():
