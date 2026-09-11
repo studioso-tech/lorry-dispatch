@@ -256,3 +256,20 @@ def test_replan_rejects_unknown_customer():
                     "source": "system", "evidence_ref": "ORD-1"}],
     })
     assert r.status_code == 400
+
+
+
+def test_return_endpoint_proposes_options_in_priority_order():
+    """持ち戻りの連絡に、優先順の手と責任の所在を返す。"""
+    from tests.test_returns import _day
+
+    _s, _plan, e = _day()
+    r = client.post("/api/return", json={
+        "seed": 20261015, "date": "2026-10-15", "vehicle_id": e.vehicle_id,
+        "customer_id": e.customer_id, "product": e.product.value, "volume_l": e.volume_l,
+    })
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body["chosen"]["kind"] in ("redeliver", "cushion", "buyback")
+    assert "元売の管理責任" in body["responsibility_ja"]
+    assert any(o["kind"] == "buyback" for o in body["options"])

@@ -30,6 +30,7 @@ from core.domain import minutes_to_hhmm
 from core.generator import generate
 from core.domain import Product
 from core.replan import NewOrder, format_replan_ja, replan
+from core.returns import RESPONSIBILITY_JA, ReturnEvent, format_return_ja, handle_return
 from core.solver import Plan, SolveMode, VehicleDay, format_plan_ja, solve
 from core.travel import build_matrix
 
@@ -542,6 +543,49 @@ def intake_note(req: NoteIntakeRequest) -> dict:
     ledger.record(req.subject, "intake", amount, plan_id=plan_id,
                   detail=f"note action={body['action']} orders={len(body['orders'])}")
     return body
+
+
+class ReturnRequest(PlanRequest):
+    """持ち戻りの連絡（計画配送の先で、持って行った量を降ろせない）。"""
+
+    vehicle_id: str
+    customer_id: str
+    product: Product
+    volume_l: int = Field(gt=0)
+
+
+@app.post("/api/return")
+def make_return(req: ReturnRequest) -> dict:
+    """持ち戻りへの手を優先順に返す: 近くの降ろし先 → クッション → 買い戻し。
+
+    朝の計画は再現モードで組み直す（/api/plan と同じ計画を土台にする）。
+    費用は元売の管理責任で、運送会社・SSへの請求は無い（実務）。
+    """
+    try:
+        scenario = generate(
+            seed=req.seed, date=req.date, season=req.season,
+            absent_drivers=tuple(req.absent_drivers),
+            declined_customers=tuple(req.declined_customers),
+        )
+        plan = solve(scenario, matrix=build_matrix(scenario.depot, scenario.customers),
+                     workers=settings.solve_workers, mode=SolveMode.REPRODUCIBLE)
+        r = handle_return(scenario, plan, ReturnEvent(req.vehicle_id, req.customer_id,
+                                                      req.product, req.volume_l))
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    c = r.chosen
+    return {
+        "summary_ja": r.summary_ja(),
+        "text_ja": format_return_ja(r),
+        "responsibility_ja": RESPONSIBILITY_JA,
+        "chosen": {"kind": c.kind, "destination": c.destination, "extra_min": c.extra_min,
+                   "arrive": minutes_to_hhmm(c.arrive_min) if c.arrive_min is not None else None},
+        "options": [
+            {"rank": o.rank, "kind": o.kind, "destination": o.destination, "extra_min": o.extra_min,
+             "feasible": o.feasible, "reason": o.reason}
+            for o in r.options
+        ],
+    }
 
 
 @app.get("/api/escapes")
