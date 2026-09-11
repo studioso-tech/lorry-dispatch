@@ -5,6 +5,9 @@
 
 **持ち戻り品の処分が最優先**。積んだままでは後の配送がその制約を受けるので、
 次の配送の時刻がずれても先に降ろす。間に合わなくなった先は他のローリーで持つ。
+
+**量は槽の単位**。槽の全量が入らなければその槽は降ろさないので、3kLのような
+半端な持ち戻りは起こり得ない。
 """
 
 from __future__ import annotations
@@ -15,7 +18,13 @@ from functools import lru_cache
 import pytest
 
 from core.generator import generate
-from core.returns import RESPONSIBILITY_JA, ReturnEvent, format_return_ja, handle_return
+from core.returns import (
+    COMPARTMENT_UNIT_L,
+    RESPONSIBILITY_JA,
+    ReturnEvent,
+    format_return_ja,
+    handle_return,
+)
 from core.solver import SolveMode, solve
 from core.travel import build_matrix
 
@@ -31,7 +40,10 @@ def _day():
                 c = by_id[st.customer_id]
                 if c.mandatory_basis == "planned":
                     p, v = max(c.demand_by_product().items(), key=lambda kv: kv[1])
-                    return s, plan, ReturnEvent(vd.vehicle_id, c.id, p, min(3_000, v))
+                    # 持ち戻りは槽の単位。槽の全量が入らなければその槽は降ろさない
+                    vol = min(4_000, v // COMPARTMENT_UNIT_L * COMPARTMENT_UNIT_L)
+                    if vol:
+                        return s, plan, ReturnEvent(vd.vehicle_id, c.id, p, vol)
     raise AssertionError("計画配送の先が今日の計画に無い")
 
 
@@ -42,12 +54,26 @@ def _vehicle_day(s, plan, e):
     return vd, trip, idx
 
 
-def test_nearby_redelivery_comes_first_even_if_the_cushion_is_shorter():
-    """近くで降ろせる先があれば、クッションより寄り道が長くてもそちらを選ぶ（実務の優先順）。"""
+def test_nearby_redelivery_is_preferred_when_a_whole_compartment_fits():
+    """近くにその槽が丸ごと入る先があれば、クッションより先にそちらへ回す（実務の優先順）。"""
     s, plan, e = _day()
-    r = handle_return(s, plan, e)
+    r = handle_return(s, plan, replace(e, volume_l=2_000))   # 2kL槽ぶん
     assert r.chosen.kind == "redeliver"
     assert any(o.kind == "cushion" and o.feasible for o in r.options)
+
+
+def test_a_bigger_compartment_can_stop_fitting_where_a_smaller_one_did():
+    """槽は丸ごとでしか降ろせない。2kLなら入る近くの先でも、4kLでは入らないことがある。
+
+    SSの空きは1日の売上ぶんしかない。半端に降ろして残りを持ち帰ることはできないので
+    （実務）、槽が大きいほど近くでは捌けず、クッションへ回ることになる。
+    """
+    s, plan, e = _day()
+    small = handle_return(s, plan, replace(e, volume_l=2_000))
+    big = handle_return(s, plan, replace(e, volume_l=4_000))
+    assert small.chosen.kind == "redeliver"
+    assert big.chosen.kind == "cushion"
+    assert all(not o.feasible for o in big.options if o.kind == "redeliver")
 
 
 def test_cushion_when_no_nearby_customer_has_room():
@@ -122,6 +148,14 @@ def test_responsibility_is_stated():
     s, plan, e = _day()
     text = format_return_ja(handle_return(s, plan, e))
     assert RESPONSIBILITY_JA in text
+
+
+def test_half_a_compartment_cannot_be_returned():
+    """槽の全量が入らなければその槽は降ろさない。3kLのような半端な持ち戻りは起きない（実務）。"""
+    s, plan, e = _day()
+    assert e.volume_l % COMPARTMENT_UNIT_L == 0
+    with pytest.raises(ValueError, match="槽の単位"):
+        handle_return(s, plan, replace(e, volume_l=3_000))
 
 
 def test_bad_events_are_rejected():

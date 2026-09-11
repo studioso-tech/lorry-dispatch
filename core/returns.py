@@ -28,6 +28,13 @@
     - **拘束・運転の上限だけは崩さない**（法令）。超えるときは後の便から順に
       他のローリーへ渡して収める。渡しても収まらない手だけを、成り立たないとする
 
+**持ち戻る量は槽の単位**（実務）
+------------------------------
+
+槽は2kLと4kLの組合せで、**その槽の全量が入らなければ、その槽は降ろさない**。途中まで
+降ろして半端を持ち帰ることはしない。よって持ち戻りの量は必ず**2kLの倍数**で、3kLの
+ような量は起こり得ない。降ろし先に「丸ごと入る空き」を求めているのは、この裏返し。
+
 候補を探すときに見るもの:
 
     - その油種のタンクに**丸ごと入る空き**があるか。今日すでに降ろした先や、
@@ -36,7 +43,8 @@
 
 **近似**:
 
-    - 分けて降ろす（2軒に半分ずつ）は見ない
+    - 複数槽ぶんを持ち戻ったとき、槽ごとに分けて2軒へ降ろすことは見ない
+      （丸ごと入る先だけを探す）
     - 引き継ぎの単位は「後の便まるごと」または「この便の後ろの先」。渡した先を
       他のどのローリーが持てるかまでは、ここでは決めない（当日の組み直しの仕事）
     - 休憩は入れ直さない。拘束は朝の計画の始まりから帰庫までで数える
@@ -47,6 +55,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 
 from core.domain import (
+    COMPARTMENT_SIZES_L,
     Customer,
     CustomerType,
     Product,
@@ -67,6 +76,9 @@ PRODUCT_JA = {
 
 #: 乗務員から車庫へ連絡し、降ろし先を決めて動き出すまで（仮置）。
 CONFIRM_MIN = 10
+
+#: 持ち戻る量の刻み。槽は2kLと4kLなので、槽の単位＝2kLの倍数にしかならない。
+COMPARTMENT_UNIT_L = min(COMPARTMENT_SIZES_L)
 
 RESPONSIBILITY_JA = (
     "費用は元売の管理責任（計画配送の先の在庫は元売が管理する）。"
@@ -198,6 +210,10 @@ def handle_return(scenario: Scenario, plan: Plan, event: ReturnEvent) -> ReturnP
         raise ValueError(f"{vd.vehicle_name} は今日 {failed.name} に行く予定が無い")
     if event.volume_l <= 0:
         raise ValueError("持ち戻りの量は正の値")
+    if event.volume_l % COMPARTMENT_UNIT_L:
+        raise ValueError(
+            f"持ち戻りの量は槽の単位（{COMPARTMENT_UNIT_L}L の倍数）: {event.volume_l}L。"
+            "その槽の全量が入らなければその槽は降ろさないので、半端な量は残らない")
 
     veh = next(v for v in scenario.vehicles if v.id == event.vehicle_id)
     driver = scenario.driver(veh.driver_id)
