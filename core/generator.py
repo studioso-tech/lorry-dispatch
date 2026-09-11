@@ -110,16 +110,23 @@ ROSTER: tuple[CustomerSpec, ...] = (
 
 @dataclass(frozen=True)
 class TypeProfile:
-    """類型ごとのタンク構成・時間枠・荷卸時間。
+    """類型ごとのタンク構成・時間枠・荷卸しの口径。
 
     window は「受入を開始できる時刻の範囲」。close は締切であって、
     その時刻に着けばよい。運送会社営業所の 08:30 締切は、朝の出庫が
     終わったあとの受入を想定していない現場の運用そのもの。
+
+    荷卸時間はここでは持たない。**降ろす量から決まる**（domain.unload_minutes）。
+    以前は類型ごとの定数（30〜45分）を置いていて、2kL置くのも16kL置くのも
+    同じ時間になっていた。
     """
 
     window_open: str
     window_close: str
-    service_min: int
+    #: 荷卸しの実効口径（インチ）。**仮置。** 実務では需要家ごとに荷役条件の
+    #: マスターに載っている。ここでは「郊外の小さいSSは配管が3インチ」とだけ
+    #: 置いてある。どの先が3インチかは確認が取れていない。
+    bore_inch: int
     #: 油種 -> (タンク容量L, 平年の1日消費L)
     tanks: dict[Product, tuple[int, int]]
 
@@ -135,7 +142,7 @@ PROFILES: dict[CustomerType, TypeProfile] = {
     CustomerType.URBAN_GS_24H: TypeProfile(
         window_open="05:00",
         window_close="21:00",
-        service_min=35,
+        bore_inch=4,
         tanks={
             Product.REGULAR: (15_000, 1_700),
             Product.PREMIUM: (5_000, 420),
@@ -146,7 +153,7 @@ PROFILES: dict[CustomerType, TypeProfile] = {
     CustomerType.URBAN_GS_DAY: TypeProfile(
         window_open="08:00",
         window_close="17:00",
-        service_min=35,
+        bore_inch=4,
         tanks={
             Product.REGULAR: (12_000, 1_300),
             Product.PREMIUM: (4_000, 320),
@@ -157,7 +164,7 @@ PROFILES: dict[CustomerType, TypeProfile] = {
     CustomerType.SANIN_GS: TypeProfile(
         window_open="07:00",
         window_close="18:00",
-        service_min=40,
+        bore_inch=4,
         tanks={
             Product.REGULAR: (12_000, 1_200),
             Product.GASOIL: (10_000, 1_000),
@@ -168,7 +175,7 @@ PROFILES: dict[CustomerType, TypeProfile] = {
     CustomerType.CARRIER_DEPOT: TypeProfile(
         window_open="05:00",
         window_close="08:30",
-        service_min=45,
+        bore_inch=4,
         tanks={
             # 営業所は軽油だけ。まとまった量を、朝の出庫前に入れる。
             Product.GASOIL: (20_000, 2_200),
@@ -177,7 +184,7 @@ PROFILES: dict[CustomerType, TypeProfile] = {
     CustomerType.SUBURBAN_GS: TypeProfile(
         window_open="07:00",
         window_close="19:00",
-        service_min=30,
+        bore_inch=3,
         tanks={
             Product.REGULAR: (8_000, 750),
             Product.GASOIL: (6_000, 550),
@@ -230,12 +237,17 @@ ULLAGE_RATIO = 0.05
 #: 元売りが半期（4-9月／10-3月）ごとに専属契約の台数を提示し、運送会社が
 #: それに非専属を足す。**何台要るかは体制設計層が掃引で出す答え**であって、
 #: ここはその掃引の出発点にすぎない。
+#:
+#: **槽は 2kL と 4kL の組合せだけ。** 法令（危険物の規制に関する政令 第15条）は
+#: 1室4,000L以下と定め、実際の車はこの2種類を組み合わせて作られている。
+#: 以前は 5,000L や 3,000L の槽を置いていたが、どちらも存在しない。
+#: 2号車の 2/4/4/2/4/4 は、実在する20kL車の6槽タイプそのもの。
 FLEET: tuple[tuple[str, str, VehicleClass, tuple[int, ...]], ...] = (
-    ("v1", "1号車", VehicleClass.TRAILER, (5_000, 5_000, 5_000, 5_000, 4_000)),   # 24kL
-    ("v2", "2号車", VehicleClass.TRAILER, (5_000, 5_000, 5_000, 5_000)),          # 20kL
-    ("v3", "3号車", VehicleClass.TRAILER, (5_000, 4_000, 5_000, 4_000)),          # 18kL
-    ("v4", "4号車", VehicleClass.RIGID, (4_000, 4_000, 4_000, 4_000)),            # 16kL
-    ("v5", "5号車", VehicleClass.RIGID, (4_000, 3_000, 3_000, 4_000)),            # 14kL
+    ("v1", "1号車", VehicleClass.TRAILER, (2_000, 4_000, 4_000, 2_000, 4_000, 4_000, 4_000)),  # 24kL 7槽
+    ("v2", "2号車", VehicleClass.TRAILER, (2_000, 4_000, 4_000, 2_000, 4_000, 4_000)),         # 20kL 6槽
+    ("v3", "3号車", VehicleClass.TRAILER, (2_000, 4_000, 4_000, 2_000, 4_000, 2_000)),         # 18kL 6槽
+    ("v4", "4号車", VehicleClass.RIGID, (4_000, 4_000, 4_000, 4_000)),                         # 16kL 4槽
+    ("v5", "5号車", VehicleClass.RIGID, (2_000, 4_000, 4_000, 4_000)),                         # 14kL 4槽
 )
 
 DRIVER_NAMES: tuple[str, ...] = ("乗務員A", "乗務員B", "乗務員C", "乗務員D", "乗務員E")
@@ -339,11 +351,11 @@ def generate(
                 tanks=_make_tanks(rng, spec.type, season),
                 window_open_min=hhmm_to_minutes(profile.window_open),
                 window_close_min=hhmm_to_minutes(profile.window_close),
-                service_min=profile.service_min,
                 accepts_trailer=(
                     ACCEPTS_TRAILER[spec.type]
                     and spec.id not in RIGID_ONLY_CUSTOMERS
                 ),
+                bore_inch=profile.bore_inch,
             )
         )
 

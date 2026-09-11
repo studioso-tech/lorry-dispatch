@@ -121,3 +121,100 @@ def test_demand_fits_realistic_scale():
         # 総需要は車両総容量の 1〜4 倍。1未満なら1日で片付いてしまい
         # 配車の問題にならず、4倍を超えると何をしても回らない。
         assert 1.0 <= total / s.fleet_capacity_l <= 4.0, (seed, total)
+
+
+# ---------------------------------------------------------------------------
+# 荷卸時間（運送会社への聞き取り 2026-09-11）
+# ---------------------------------------------------------------------------
+
+
+def test_unload_flow_matches_field_measurements():
+    """流下時間が聞き取りの実測値を再現すること。
+
+    **自然落下なので経路で一番細いところが律速する。**
+
+        4インチ  4kL で5分 / 2kL で3分
+        3インチ  4kL で8分 / 2kL で4分
+
+    ここが崩れたら、係数を誰かが「それらしく」いじったということ。
+    """
+    from core.domain import UNLOAD_SETUP_MIN, unload_minutes
+    from core.domain import Product as P
+
+    flow = lambda v, bore: unload_minutes({P.REGULAR: v}, bore) - UNLOAD_SETUP_MIN
+    assert flow(4_000, 4) == 5
+    assert flow(2_000, 4) == 3
+    assert flow(4_000, 3) == 8
+    assert flow(2_000, 3) == 4
+
+
+def test_unload_total_matches_carrier_allowance():
+    """準備・手仕舞を含めた合計が、運送会社の見込み（30分／60分）と合うこと。
+
+    流量の実測と現場の段取りが、準備20分という1つの数字で両方説明できる。
+    **片方だけ合わせた係数は、もう片方で嘘をつく。**
+    """
+    from core.domain import Product as P, unload_minutes
+
+    # 4インチで8kL（2槽）→ 見込み30分
+    assert unload_minutes({P.REGULAR: 4_000, P.GASOIL: 4_000}, 4) == 30
+    # 3インチで20kL（1台まるごと、5槽）→ 見込み60分
+    assert unload_minutes({P.KEROSENE: 20_000}, 3) == 60
+
+
+def test_unload_time_depends_on_volume():
+    """荷卸時間が降ろす量で変わること。
+
+    以前は類型ごとの定数で、2kL置くのも16kL置くのも同じ35分だった。
+    """
+    s = generate(seed=20261015, season="winter")
+    by_type: dict = {}
+    for c in s.customers:
+        if c.demand_l:
+            by_type.setdefault((c.type, c.bore_inch), set()).add(c.service_min)
+    assert any(len(v) > 1 for v in by_type.values()), "同じ類型・口径で荷卸時間がすべて同じ"
+
+
+def test_compartments_obey_hazmat_law():
+    """1室は4,000L以下（危険物の規制に関する政令 第15条）。
+
+    以前の生成器には 5,000L の槽を持つ車が3台いた。法令上作れない車で
+    組んだ計画は、存在しない車の計画である。
+    """
+    from core.domain import COMPARTMENT_MAX_L, Vehicle, VehicleClass
+
+    for v in generate(seed=1).vehicles:
+        assert max(v.compartments_l) <= COMPARTMENT_MAX_L, (v.id, v.compartments_l)
+
+    with pytest.raises(ValueError, match="第15条"):
+        Vehicle(
+            id="bad", name="5kL槽", vehicle_class=VehicleClass.TRAILER,
+            compartments_l=(5_000, 5_000, 5_000, 5_000), driver_id="d1",
+        )
+
+
+def test_compartments_are_2kl_or_4kl():
+    """槽は 2kL と 4kL の組合せだけ（実務）。
+
+    法令は上限しか決めていないが、実際の車はこの2種類で作られている。
+    以前は 3kL の槽を持つ車が2台いた。
+    """
+    from core.domain import COMPARTMENT_SIZES_L, Vehicle, VehicleClass
+
+    for v in generate(seed=1).vehicles:
+        assert set(v.compartments_l) <= set(COMPARTMENT_SIZES_L), (v.id, v.compartments_l)
+
+    with pytest.raises(ValueError, match="槽は無い"):
+        Vehicle(
+            id="bad", name="3kL槽", vehicle_class=VehicleClass.RIGID,
+            compartments_l=(4_000, 3_000, 3_000, 4_000), driver_id="d1",
+        )
+
+
+def test_bore_must_be_a_real_hose_size():
+    """荷卸しの口径は実在する2種類（4インチ・3インチ）だけ。"""
+    from dataclasses import replace
+
+    c = generate(seed=1).customers[0]
+    with pytest.raises(ValueError, match="口径"):
+        replace(c, bore_inch=5)

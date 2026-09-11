@@ -374,11 +374,11 @@ def test_only_real_capacities_exist():
     for v in s.vehicles:
         assert v.capacity_l in CAPACITIES_L[v.vehicle_class], (v.id, v.capacity_l)
 
-    # 型の側でも弾いていること
+    # 型の側でも弾いていること（槽は正しいが合計が実在しない）
     with pytest.raises(ValueError, match="kL 積は無い"):
         Vehicle(
             id="bad", name="10kL", vehicle_class=VehicleClass.RIGID,
-            compartments_l=(5_000, 5_000), driver_id="d1",
+            compartments_l=(4_000, 4_000, 2_000), driver_id="d1",
         )
 
 

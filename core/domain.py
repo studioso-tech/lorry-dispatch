@@ -80,6 +80,77 @@ def labor_break_min(duty_min: int) -> int:
     return LABOR_BREAK_60_MIN
 
 
+#: 移動貯蔵タンクの1室の上限（危険物の規制に関する政令 第15条）。
+#:
+#: 「4,000L以下ごとに完全な間仕切を設ける」。**槽はこれより大きくできない。**
+#: 最初の実装には 5,000L の槽を持つ車がいたが、法令上そんな槽は無い。
+COMPARTMENT_MAX_L = 4_000
+
+#: 実在する槽の大きさ。**2kL と 4kL の組合せだけ。**（実務）
+#:
+#: 法令は上限（4kL）しか定めていないが、実際のローリーはこの2種類を
+#: 組み合わせて作られている。たとえば20kL車なら
+#:
+#:     2/4/2/4/4/2/2（7槽）   2/4/4/2/4/4（6槽）
+#:
+#: 以前は 3kL の槽を置いていたが、そんな槽は無い。
+COMPARTMENT_SIZES_L: tuple[int, ...] = (2_000, 4_000)
+
+#: 荷卸しの準備と手仕舞（着車・アース・ホース接続・検尺・伝票・収納）。
+#:
+#: 流下そのものとは別にかかる時間。流量の実測と、運送会社が1か所あたりに
+#: 見込んでいる時間（30分／60分）の両方を、この1つの数字で説明できる:
+#:
+#:     4インチで8kL（2槽）   流下10分 ＋ 20分 ＝ 30分   （見込み 30分）
+#:     3インチで20kL（1台分） 流下40分 ＋ 20分 ＝ 60分   （見込み 60分）
+UNLOAD_SETUP_MIN = 20
+
+#: 荷卸しの流下。**自然落下なので、経路で一番細いところが律速する。**
+#:
+#: ホースは4インチと3インチの2種類。条件のよい先（地下タンク側の配管も
+#: 4インチ）なら4インチ、そうでなければ3インチ相当になる。流量は断面積に
+#: 比例するので、3インチは4インチのおよそ半分（断面積比 (3/4)² ≒ 0.56）。
+#:
+#: 運送会社への聞き取り（2026-09-11）:
+#:
+#:     4インチ  4kL で5分 / 2kL で3分
+#:     3インチ  4kL で8分 / 2kL で4分
+#:
+#: 2点を通る直線にすると、1槽あたり
+#:
+#:     4インチ  1分 ＋ 1.0分/kL   （1分は槽ごとの弁の開閉などの切替）
+#:     3インチ  0分 ＋ 2.0分/kL
+#:
+#: 口径 → (1槽あたりの切替分, 1kLあたりの分)
+UNLOAD_FLOW: dict[int, tuple[float, float]] = {
+    4: (1.0, 1.0),
+    3: (0.0, 2.0),
+}
+
+
+def unload_minutes(volume_by_product: dict, bore_inch: int) -> int:
+    """1か所の荷卸しに要する時間（着車〜出発）。
+
+    **降ろす量に比例する。** 以前は需要家の類型ごとの定数（30〜45分）で、
+    2kL置くのも16kL置くのも同じ時間になっていた。
+
+    槽は油種ごとに分かれ、1槽は4kLまで（COMPARTMENT_MAX_L）なので、
+    油種ごとに「何槽ぶんか」を数えて切替分を積む。槽は1本ずつ順に降ろす
+    前提（ホース1本で同時に2槽は降ろさない）。
+
+    槽の数は「4kL槽で詰めた場合」の最少数で数えている。実際は2kL槽も
+    あるので、どの槽に積むか（多コンパートメント割当、未実装）次第で
+    1〜2槽ぶん増えうる。4インチなら1槽1分なので影響は小さい。
+    """
+    if bore_inch not in UNLOAD_FLOW:
+        raise ValueError(f"荷卸しの口径は {sorted(UNLOAD_FLOW)} インチのいずれか: {bore_inch}")
+    per_compartment, per_kl = UNLOAD_FLOW[bore_inch]
+    compartments = sum(-(-v // COMPARTMENT_MAX_L) for v in volume_by_product.values() if v > 0)
+    total_kl = sum(v for v in volume_by_product.values() if v > 0) / 1000
+    flow = compartments * per_compartment + total_kl * per_kl
+    return UNLOAD_SETUP_MIN + int(round(flow))
+
+
 class Product(str, Enum):
     """積む油種。
 
@@ -239,7 +310,6 @@ class Customer:
     tanks: tuple[Tank, ...]
     window_open_min: int      # 受入開始（0時からの分）
     window_close_min: int     # 受入終了。この時刻までに**荷卸を始められる**こと
-    service_min: int          # 荷卸に要する時間（着車〜出発）
 
     #: トレーラーが入れるか。**荷役条件のマスターに載っている情報**。
     #:
@@ -247,6 +317,26 @@ class Customer:
     #: トレーラーが物理的に入れない。そこには単車が優先的に配車される。
     #: 積載量の問題ではないので、容量制約とは別に持つ。
     accepts_trailer: bool = True
+
+    #: 荷卸しの実効口径（インチ）。**ホースと地下タンク側の配管のうち細いほう。**
+    #: 荷役条件のマスターに載っている情報。4インチ配管の先なら4、そうでなければ3。
+    bore_inch: int = 4
+
+    def __post_init__(self) -> None:
+        if self.bore_inch not in UNLOAD_FLOW:
+            raise ValueError(
+                f"{self.id}: 荷卸しの口径は {sorted(UNLOAD_FLOW)} インチのいずれか"
+                f"（{self.bore_inch}）"
+            )
+
+    @property
+    def service_min(self) -> int:
+        """荷卸に要する時間（着車〜出発）。**今日降ろす量から決まる。**
+
+        配送量は計画時点で需要どおりに固定されている（ソルバーは量を
+        動かさない）ので、ここで前もって計算できる。
+        """
+        return unload_minutes(self.demand_by_product(), self.bore_inch)
 
     @property
     def demand_l(self) -> int:
@@ -316,6 +406,18 @@ class Vehicle:
 
         黙って通すと、作り物の車で組んだ計画を現実だと思って読むことになる。
         """
+        oversized = [c for c in self.compartments_l if c > COMPARTMENT_MAX_L]
+        if oversized:
+            raise ValueError(
+                f"{self.id}: 1室は {COMPARTMENT_MAX_L}L 以下（危険物の規制に関する政令"
+                f" 第15条）。{oversized} は法令上作れない"
+            )
+        odd = [c for c in self.compartments_l if c not in COMPARTMENT_SIZES_L]
+        if odd:
+            raise ValueError(
+                f"{self.id}: 槽は {'/'.join(f'{c // 1000}kL' for c in COMPARTMENT_SIZES_L)}"
+                f" の組合せだけ。{odd} の槽は無い"
+            )
         allowed = CAPACITIES_L[self.vehicle_class]
         total = sum(self.compartments_l)
         if total not in allowed:
