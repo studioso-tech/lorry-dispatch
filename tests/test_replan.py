@@ -86,15 +86,38 @@ def test_without_spot_a_planned_delivery_is_deferred_not_the_order():
 
     発注は需要家の約束、計画配送は運送会社側の都合で1日ずらせる。ずらしたら
     逃げ道として記録する（恒常化の監視が数える）。
+
+    データ任せだと「ずらせば入る」日がなかなか無いので、確実にそうなる形を
+    組み立てる: **同じ場所・同じ量の2軒**（片方は今日が計画配送の日、片方は
+    当日発注）を置き、車は1軒ぶんしか回れない拘束にする。正しい答えは
+    「発注を入れ、計画配送を明日へ」の1つだけ。
     """
-    s, base = _base(20261016, "2026-10-16", ("v4", "v5"))
-    orders = _surge(s, base)
-    r = replan(s, base, now_min=8 * 60, orders=orders, spot_standby=0)
+    from dataclasses import replace
+
+    from core.domain import Scenario
+
+    s = generate(seed=20261015, date="2026-10-15", season="winter")
+    planned = next(c for c in s.customers if c.planned and c.mandatory_basis == "planned")
+    twin = replace(planned, id="c90", name="同じ場所の別のSS", planned=(), orders=())
+    driver = s.driver("d4")
+    s1 = Scenario(date=s.date, season=s.season, seed=s.seed, depot=s.depot,
+                  customers=(planned, twin),
+                  vehicles=tuple(v for v in s.vehicles if v.id == "v4"),
+                  drivers=s.drivers)
+    base = solve(s1, matrix=build_matrix(s1.depot, s1.customers), time_limit_s=TIME_LIMIT_S)
+    assert [st.customer_id for t in base.trips for st in t.stops] == [planned.id]
+    # 1軒ぶんしか回れない拘束にする
+    tight = base.vehicle_days[0].duty_min + 5
+    s1.drivers = tuple(replace(d, max_duty_min=tight) if d.id == driver.id else d for d in s1.drivers)
+
+    product, volume = planned.planned[0]
+    r = replan(s1, base, now_min=s1.depot.open_min,
+               orders=[NewOrder(twin.id, product, min(volume, twin.tanks[0].topup_l), "system", "ORD-T")])
     assert r.ok, format_replan_ja(r)
-    assert r.escapes, "計画配送をずらさずに入った（この日は入らないはず）"
-    assert all(e.kind == "defer_planned" for e in r.escapes)
+    assert [e.customer_id for e in r.escapes] == [planned.id]
+    assert r.escapes[0].kind == "defer_planned"
     placed = {st.customer_id for vd in r.sub_plan.vehicle_days for t in vd.trips for st in t.stops}
-    assert {o.customer_id for o in orders} <= placed
+    assert placed == {twin.id}
 
 
 def test_spot_is_called_before_deferring_planned_deliveries():
@@ -147,3 +170,33 @@ def test_unknown_customer_or_product_is_rejected():
     carrier = next(c for c in s.customers if all(t.product is Product.GASOIL for t in c.tanks))
     with pytest.raises(ValueError, match="タンクは無い"):
         replan(s, base, now_min=480, orders=[NewOrder(carrier.id, Product.KEROSENE, 1_000, "system", "X")])
+
+
+@pytest.mark.parametrize("seed,date,now", [
+    (20261016, "2026-10-16", 9 * 60 + 30),
+    (20261015, "2026-10-15", 8 * 60),
+    (20261016, "2026-10-16", 6 * 60),
+])
+def test_replan_without_orders_keeps_the_morning_plan(seed, date, now):
+    """**何も差し込まなければ、朝の計画がそのまま残る。**
+
+    組み直しが朝の計画と同じ規則で動いているかの、いちばん確かな確かめ方。
+    ここが崩れていたことが2度あった:
+
+    - 朝から働いている車を午後に使うと、朝からの拘束がまるごと費用に乗り、
+      使っていない車を新たに出すほうが安く見えて担当が入れ替わった
+    - 午後の仕事だけで休憩の要否を見ていて、午前に休憩の余裕が無かった車の
+      休憩が1時間抜けた（16:57帰庫が15:57帰庫になった）
+    """
+    from core.solver import SolveMode
+
+    s = generate(seed=seed, date=date, season="winter")
+    base = solve(s, matrix=build_matrix(s.depot, s.customers), mode=SolveMode.REPRODUCIBLE)
+    r = replan(s, base, now_min=now, orders=[])
+    assert r.changes == ()
+    assert not r.escapes and not r.spot_called
+    before = {vd.vehicle_id: (vd.duty_end_min, [[st.customer_id for st in t.stops] for t in vd.trips])
+              for vd in base.vehicle_days}
+    after = {vd.vehicle_id: (vd.duty_end_min, [[st.customer_id for st in t.stops] for t in vd.trips])
+             for vd in r.vehicle_days}
+    assert before == after

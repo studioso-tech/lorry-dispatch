@@ -1,1 +1,5 @@
 """HTTP と外部連携。数字は core が出す。"""
+
+from app import local_tls
+
+local_tls.ensure()

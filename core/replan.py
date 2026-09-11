@@ -294,6 +294,14 @@ def replan(
                     available_from_min=frozen[-1].return_min,
                     duty_origin_min=vd.duty_start_min,
                     driven_min=sum(t.drive_min for t in frozen),
+                    # **朝の計画と同じ定義で数える**（運転＋荷卸し＋積込）。朝の計画は
+                    # 手待ちを仕事に数えていない。手待ちまで数えると組み直しのほうが
+                    # 厳しくなり、ぎりぎりで成り立っていた朝の計画が組み直すと成り立た
+                    # なくなって、発注が1件も増えていないのに朝の発注が落ちた。
+                    # 原則: **朝の計画は、組み直しの規則でも必ず成り立つ。**
+                    worked_min=sum(
+                        t.drive_min + t.service_min + scenario.depot.load_min for t in frozen
+                    ),
                 )
             )
         else:

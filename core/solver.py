@@ -727,8 +727,8 @@ def solve(
             and (da.max_duty_min, da.max_drive_min) == (db.max_duty_min, db.max_drive_min)
             and da.available == db.available
             # 途中から解くときは、空く時刻や今日の拘束が違えば別物
-            and (a.spot, a.available_from_min, a.duty_origin_min, a.driven_min)
-            == (b.spot, b.available_from_min, b.duty_origin_min, b.driven_min)
+            and (a.spot, a.available_from_min, a.duty_origin_min, a.driven_min, a.worked_min)
+            == (b.spot, b.available_from_min, b.duty_origin_min, b.driven_min, b.worked_min)
             and a.vehicle_class == b.vehicle_class
         )
 
@@ -917,7 +917,11 @@ def solve(
         model.Add(duty_v <= d.max_duty_min)
 
         # 休憩と積込のぶんの余裕を、拘束時間の中に確保しておく。
-        model.Add(duty_v >= work_v + break_v).OnlyEnforceIf(used[v])
+        # 組み直しでは午前の仕事（worked_min）も足す。拘束は朝から数えているので、
+        # 「午前の仕事＋午後の仕事＋1日ぶんの休憩」が拘束の中に収まる必要がある。
+        # 最初は午後の仕事だけで見ていて、午前に休憩の余裕が無かった車の休憩が
+        # 1時間抜けた（朝の計画で16:57帰庫の車が、組み直すと15:57帰庫になった）。
+        model.Add(duty_v >= fleet[v].worked_min + work_v + break_v).OnlyEnforceIf(used[v])
         duty.append(duty_v)
 
     # --- 目的関数 ----------------------------------------------------------
@@ -945,13 +949,28 @@ def solve(
                 if v != vid_index[b]
             )
 
+    # **すでに発生した拘束は費用に数えない。** 組み直しでは、午前の便で拘束が
+    # 始まった車の「朝から空くまで」は、午後に使っても使わなくても払っている。
+    # 制約（拘束13時間）は朝から通しで数えるが、費用は午後に増える分だけ。
+    # 最初はここを数えていて、朝4時から働いている車を午後に使うと朝からの
+    # 拘束がまるごと費用に乗り、使っていない車を新たに出すほうが安く見えた。
+    # 発注が1件も入らない組み直しで、担当が入れ替わっていた。
+    # 出庫済みの車には「車を1台出す固定費」もかけない。
+    def sunk(veh: Vehicle) -> int:
+        if veh.duty_origin_min is None:
+            return 0
+        return max(0, start_of(veh) - veh.duty_origin_min)
+
+    duty_cost = sum(duty[v] - sunk(fleet[v]) * used[v] for v in range(V))
+    fresh = [used[v] for v in range(V) if fleet[v].duty_origin_min is None]
+
     primary = model.NewIntVar(0, 10**9, "primary")
     model.Add(
         primary
         == sum(drive)
-        + DUTY_COST_PER_MIN * sum(duty)
+        + DUTY_COST_PER_MIN * duty_cost
         + sum(penalties)
-        + VEHICLE_FIXED_COST_MIN * sum(used)
+        + VEHICLE_FIXED_COST_MIN * sum(fresh)
         # 非専属は呼ぶと割高（専属の余りで入るなら呼ばない）
         + SPOT_CALL_COST_MIN * sum(used[v] for v, veh in enumerate(fleet) if veh.spot)
         + sum(changes)
