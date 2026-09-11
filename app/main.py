@@ -25,7 +25,7 @@ from app import ledger
 from app.config import settings
 from core.domain import minutes_to_hhmm
 from core.generator import generate
-from core.solver import Plan, format_plan_ja, solve
+from core.solver import Plan, SolveMode, format_plan_ja, solve
 from core.travel import build_matrix
 
 logging.basicConfig(level=logging.INFO)
@@ -157,6 +157,13 @@ class PlanRequest(BaseModel):
         default_factory=list, description="欠勤する乗務員ID（例 ['d1']）"
     )
     subject: str = Field(default="demo", description="利用者の識別子。台帳の単位")
+    mode: SolveMode = Field(
+        default=SolveMode.REPRODUCIBLE,
+        description=(
+            "reproducible: どのマシンでも同じ計画を返す（探索量で打ち切る。"
+            "時間は読めない）。fast: 時間で打ち切る（再現は保証しない）"
+        ),
+    )
 
 
 def _plan_to_dict(plan: Plan) -> dict:
@@ -268,11 +275,15 @@ def make_plan(req: PlanRequest) -> dict:
 
     try:
         matrix = build_matrix(scenario.depot, scenario.customers)
+        # 既定は REPRODUCIBLE。この API は審査員が手元で計画を再現する入口
+        # なので、時間より再現性を取る。当日の組み直し（エージェント層）は
+        # FAST を明示して呼ぶ。
         plan = solve(
             scenario,
             matrix=matrix,
             time_limit_s=settings.solve_time_limit_s,
             workers=settings.solve_workers,
+            mode=req.mode,
         )
     except Exception as exc:
         ledger.release(req.subject, amount)
@@ -284,7 +295,7 @@ def make_plan(req: PlanRequest) -> dict:
         "solve",
         amount,
         plan_id=plan_id,
-        detail=f"seed={req.seed} season={req.season} status={plan.status}",
+        detail=f"seed={req.seed} season={req.season} mode={req.mode.value} status={plan.status}",
     )
 
     body = _plan_to_dict(plan)

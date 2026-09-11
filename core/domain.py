@@ -319,8 +319,11 @@ class Customer:
     accepts_trailer: bool = True
 
     #: 荷卸しの実効口径（インチ）。**ホースと地下タンク側の配管のうち細いほう。**
-    #: 荷役条件のマスターに載っている情報。4インチ配管の先なら4、そうでなければ3。
-    bore_inch: int = 4
+    #:
+    #: 配管は荷役条件のマスターに載っている需要家側の情報、ホースはローリー側。
+    #: 実務ではホースが3インチのことが多い（乗務員の負担を軽くするため）ので、
+    #: 配管が4インチでも3インチになる先がほとんど。
+    bore_inch: int = 3
 
     def __post_init__(self) -> None:
         if self.bore_inch not in UNLOAD_FLOW:

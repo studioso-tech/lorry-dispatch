@@ -50,7 +50,9 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
+from enum import Enum
 
+import ortools
 from ortools.sat.python import cp_model
 
 from core.domain import (
@@ -104,8 +106,44 @@ DUTY_COST_PER_MIN = 1
 #: 1台が1日に回れる便の上限。油槽所の節点をこの数だけ複製する。
 MAX_TRIPS_PER_VEHICLE = 2
 
-#: 既定の求解時間。
+#: 既定の求解時間（FAST のとき）。
 DEFAULT_TIME_LIMIT_S = 60.0
+
+
+class SolveMode(str, Enum):
+    """求解の打ち切り方。**用途で分ける。同じ設定で両方はまかなえない。**
+
+    再現性（同じ入力なら同じ計画）と時間の上限は両立しない。実時間で
+    打ち切ると、速いマシンでは間に合い遅いマシンでは打ち切られるので、
+    機械が違えば別の計画が返る。探索の「量」で打ち切れば機械に依存しないが、
+    実時間は読めなくなる。
+
+    ただし両立させる必要は無い。用途が2つあるため:
+
+        REPRODUCIBLE  審査員の検証・回帰テスト・API の既定。
+                      時間を犠牲にして、どのマシンでも同じ計画を返す。
+        FAST          当日発注の差し込み・体制設計の掃引。
+                      「いま組み直してほしい」要求なので時間で切る。
+                      そのかわり再現は保証しないと申告する。
+    """
+
+    REPRODUCIBLE = "reproducible"
+    FAST = "fast"
+
+
+#: REPRODUCIBLE の探索量（CP-SAT の決定的時間、1段あたり）。
+#:
+#: 実時間ではない。同じ値なら、どのマシンでも同じだけ探索して同じ場所で
+#: 止まる。3台・冬の測定では 60 で実時間10〜110秒（解きやすい日は10秒で
+#: 最適性の証明まで届き、難しい日は証明しないまま同じ計画で止まる）。
+DETERMINISTIC_BUDGET = 60.0
+
+#: REPRODUCIBLE の並列数。**環境変数や vCPU 数に合わせて変えてはいけない。**
+#:
+#: 並列数が違えば探索が違い、別の計画になる。Cloud Run が4 vCPU でも、
+#: 審査員の手元が16コアでも、ここは同じ値で走らせる（コアが少なければ
+#: 実時間が延びるだけで、結果は変わらない）。
+REPRODUCIBLE_WORKERS = 8
 
 # 2段目を速くする試みで、**採らなかった**案を2つ記録しておく。どちらも
 # 一度は良さそうに見えたので、次に同じ道を通らないために残す。
@@ -127,7 +165,7 @@ DEFAULT_TIME_LIMIT_S = 60.0
 #
 # ---
 #
-# 案C（2026-09-10 に測定。**これは有望**。まだ実装していない）:
+# 案C（2026-09-10 に測定、2026-09-11 に SolveMode として実装）:
 #
 # 案Aが失敗したのは、決定的時間の予算が小さすぎたことに加えて、
 # **実時間の上限を併置していたから**だった。両方を渡すと、決定的時間で
@@ -387,6 +425,31 @@ def _break_location_risk(
     return risks
 
 
+def _new_solver(
+    mode: SolveMode, *, time_limit_s: float, workers: int, seed: int, log: bool
+) -> cp_model.CpSolver:
+    """打ち切り方を決めたソルバーを作る。
+
+    **REPRODUCIBLE で実時間の上限を置いてはいけない。** 決定的時間と実時間を
+    両方渡すと、決定的時間で切っているつもりでも実時間の側が探索に干渉し、
+    同じ設定・同じマシンの2回の実行で結果が変わった（2026-09-10 測定。
+    seed 20261016 で 98秒/FEASIBLE/計画A と 115秒/UNKNOWN/計画B）。
+    「念のため」の安全網が決定性を壊す。テストでここを固定してある。
+    """
+    s = cp_model.CpSolver()
+    s.parameters.log_search_progress = log
+    s.parameters.random_seed = seed % 2_147_483_647
+    if mode is SolveMode.REPRODUCIBLE:
+        s.parameters.num_workers = REPRODUCIBLE_WORKERS
+        s.parameters.interleave_search = True
+        s.parameters.max_deterministic_time = DETERMINISTIC_BUDGET
+        # max_time_in_seconds は既定（無制限）のまま。**置かない。**
+    else:
+        s.parameters.num_workers = workers
+        s.parameters.max_time_in_seconds = time_limit_s
+    return s
+
+
 def solve(
     scenario: Scenario,
     *,
@@ -396,6 +459,7 @@ def solve(
     max_trips: int = MAX_TRIPS_PER_VEHICLE,
     tiebreak_phase: bool = True,
     log: bool = False,
+    mode: SolveMode = SolveMode.FAST,
 ) -> Plan:
     """1日ぶんの配車を解く。
 
@@ -411,6 +475,11 @@ def solve(
             だけを知りたい用途では、2段目は要らないぶん丸ごと省ける。
             配車係や審査員に見せる計画では True のままにすること。
         log: CP-SAT の探索ログを出すか。障害調査用。
+        mode: 打ち切り方（SolveMode）。REPRODUCIBLE では time_limit_s と
+            workers を**無視する**（探索量と並列数を固定するため）。
+            既定が FAST なのは、内部の呼び出し（掃引・テスト）が時間の
+            上限を前提にしているから。審査員に見せる経路（API）は
+            REPRODUCIBLE を明示して呼ぶ。
 
     Returns:
         Plan。解けなかった場合も status と診断を入れて必ず返す。
@@ -839,16 +908,16 @@ def solve(
     # 固定して、タイブレークだけを最小化する。解空間が「最適な計画すべて」に
     # 狭まっているので2回目は速い。
     def new_solver(limit: float) -> cp_model.CpSolver:
-        s = cp_model.CpSolver()
-        s.parameters.max_time_in_seconds = limit
-        s.parameters.num_workers = workers
-        s.parameters.log_search_progress = log
-        s.parameters.random_seed = scenario.seed % 2_147_483_647
-        return s
+        return _new_solver(
+            mode, time_limit_s=limit, workers=workers, seed=scenario.seed, log=log
+        )
 
-    # 2段目は決定的時間で切るので実時間の予算をほとんど食わない。
-    # 残りは1段目に回す。**1段目が最適性を証明できるかが再現性の要**なので、
-    # 予算はできるだけこちらに寄せる。
+    # FAST のときの実時間の配分。1段目に6割、2段目に残り。
+    # REPRODUCIBLE では両段とも DETERMINISTIC_BUDGET で切るので、ここは効かない。
+    #
+    # **REPRODUCIBLE では1段目の解に戻っても決定性は崩れない。** 以前の案A が
+    # 壊れたのは、2段目が解を見つけられず1段目の解に戻ったとき、その1段目が
+    # 実時間で切られていたから。両段を決定的時間で切れば、戻る先も決定的になる。
     phase1_budget = (
         time_limit_s if not tiebreak_phase else time_limit_s * 0.6
     )
@@ -1065,7 +1134,26 @@ def solve(
             # **ここを緩めてはいけない。** 緩めた版は、計画が違うのに
             # reproducible が真を返した。
             "tiebreak_phase": tiebreak_phase,
-            "reproducible": phase1_status == "OPTIMAL" and phase2_status == "OPTIMAL",
+            "solve_mode": mode.value,
+            # 再現できる根拠。どちらでもなければ再現は保証しない。
+            #   deterministic_search  探索量で打ち切った（REPRODUCIBLE）。
+            #                         最適性を証明できなくても同じ計画が返る
+            #   proven_optimal        両段が最適性を証明した（FAST でも成立する）
+            "reproducible_basis": (
+                "deterministic_search" if mode is SolveMode.REPRODUCIBLE
+                else "proven_optimal"
+                if phase1_status == "OPTIMAL" and phase2_status == "OPTIMAL"
+                else None
+            ),
+            "reproducible": (
+                mode is SolveMode.REPRODUCIBLE
+                or (phase1_status == "OPTIMAL" and phase2_status == "OPTIMAL")
+            ),
+            # 再現の前提。**この2つが違えば、同じ入力でも別の計画になりうる。**
+            "ortools_version": ortools.__version__,
+            "workers_used": (
+                REPRODUCIBLE_WORKERS if mode is SolveMode.REPRODUCIBLE else workers
+            ),
         },
     )
 

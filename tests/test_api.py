@@ -34,7 +34,7 @@ def test_healthz():
 
 def test_plan_returns_routes_and_readable_text():
     """計画が返り、機械が読む形と人が読む形の両方が入っている。"""
-    r = client.post("/api/plan", json={"seed": 20261015, "season": "winter"})
+    r = client.post("/api/plan", json={"seed": 20261015, "season": "winter", "mode": "fast"})
     assert r.status_code == 200
     body = r.json()
     assert body["status"] in ("OPTIMAL", "FEASIBLE")
@@ -52,13 +52,27 @@ def test_plan_returns_routes_and_readable_text():
 def test_plan_reports_whether_it_is_reproducible():
     """再現できる計画かどうかを、計画自身が申告する。
 
-    両段が最適性を証明できたときだけ、同じ要求が同じ計画を返すと言える。
-    時間切れで打ち切った解にはその保証がない。**言えないことを言わない**
-    ために、診断に出して呼び出し側が判断できるようにしてある。
+    **API の既定は再現モード**（審査員が手元で計画を再現する入口なので）。
+    fast を指定したときは、両段が最適性を証明できた場合だけ再現できると
+    申告する。**言えないことを言わない**ために、根拠も一緒に出す。
     """
-    body = client.post("/api/plan", json={"seed": 4242, "season": "winter"}).json()
-    assert "reproducible" in body["diagnostics"]
-    assert isinstance(body["diagnostics"]["reproducible"], bool)
+    fast = client.post(
+        "/api/plan", json={"seed": 4242, "season": "winter", "mode": "fast"}
+    ).json()
+    assert isinstance(fast["diagnostics"]["reproducible"], bool)
+    assert fast["diagnostics"]["solve_mode"] == "fast"
+    assert fast["diagnostics"]["reproducible_basis"] in ("proven_optimal", None)
+    assert fast["diagnostics"]["reproducible"] == (
+        fast["diagnostics"]["reproducible_basis"] == "proven_optimal"
+    )
+
+
+def test_plan_defaults_to_reproducible_mode():
+    """mode を指定しなければ再現モードで解く。"""
+    from app.main import PlanRequest
+    from core.solver import SolveMode
+
+    assert PlanRequest().mode is SolveMode.REPRODUCIBLE
 
 
 def test_unknown_season_is_rejected():
@@ -69,8 +83,10 @@ def test_unknown_season_is_rejected():
 
 def test_absent_drivers_change_the_plan():
     """欠勤を入れると計画が変わり、その乗務員は出てこない（デモ4の骨格）。"""
-    base = client.post("/api/plan", json={"seed": 99}).json()
-    short = client.post("/api/plan", json={"seed": 99, "absent_drivers": ["d1"]}).json()
+    base = client.post("/api/plan", json={"seed": 99, "mode": "fast"}).json()
+    short = client.post(
+        "/api/plan", json={"seed": 99, "absent_drivers": ["d1"], "mode": "fast"}
+    ).json()
     assert short["status"] in ("OPTIMAL", "FEASIBLE")
     assert "d1" not in [vd["driver_id"] for vd in short["vehicle_days"]]
     assert short["scenario"]["usable_vehicles"] == base["scenario"]["usable_vehicles"] - 1

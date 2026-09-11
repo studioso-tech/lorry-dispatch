@@ -75,20 +75,31 @@ class CustomerSpec:
     type: CustomerType
     lat: float
     lon: float
+    #: 地下タンク側の配管の口径（インチ）。**系列の出自で決まる**（実務）。
+    #:
+    #:     旧三菱系のSS   4インチ
+    #:     それ以外       3インチ（特に旧日石系は設備が制約になる）
+    #:
+    #: 立地や規模では決まらない。ENEOS は日石と三菱の合流でできているので、
+    #: 同じ看板の下に配管の違う2系統のSSが混在している。
+    piping_inch: int = 3
 
 
 #: 重要家15軒。引き継ぎ文書 §4.2 の4類型を「1回のデモで全制約系が見える」よう配分。
 #: 座標は実在の市町の位置に合わせてあるが、事業所そのものは架空である。
+#:
+#: 配管4インチ（旧三菱系）はGS12軒のうち4軒に置いた。**どの先がそうかは架空**
+#: で、比率（約1/3）も合流時の系列の規模感から置いた仮置。
 ROSTER: tuple[CustomerSpec, ...] = (
     # --- 広島市中心部・24時間（朝は到達に時間、夜は短時間 → 時間帯係数が効く）
-    CustomerSpec("c01", "広島中央SS（24h）", CustomerType.URBAN_GS_24H, 34.3925, 132.4553),
+    CustomerSpec("c01", "広島中央SS（24h）", CustomerType.URBAN_GS_24H, 34.3925, 132.4553, piping_inch=4),
     CustomerSpec("c02", "宇品港SS（24h）", CustomerType.URBAN_GS_24H, 34.3620, 132.4620),
     CustomerSpec("c03", "観音新町SS（24h）", CustomerType.URBAN_GS_24H, 34.3800, 132.4200),
     # --- 広島市中心部・日中のみ（時間枠×ラッシュの二重縛り）
     CustomerSpec("c04", "温品SS（日中）", CustomerType.URBAN_GS_DAY, 34.4160, 132.5150),
-    CustomerSpec("c05", "祇園SS（日中）", CustomerType.URBAN_GS_DAY, 34.4450, 132.4560),
+    CustomerSpec("c05", "祇園SS（日中）", CustomerType.URBAN_GS_DAY, 34.4450, 132.4560, piping_inch=4),
     # --- 山陰側・長距離（冬の灯油ピーク＋拘束時間）
-    CustomerSpec("c06", "浜田SS", CustomerType.SANIN_GS, 34.8990, 132.0800),
+    CustomerSpec("c06", "浜田SS", CustomerType.SANIN_GS, 34.8990, 132.0800, piping_inch=4),
     CustomerSpec("c07", "益田SS", CustomerType.SANIN_GS, 34.6760, 131.8430),
     # --- 運送会社営業所（早朝枠＋軽油中心 → 製品と槽の割当が効く）
     CustomerSpec("c08", "岩国装束運輸", CustomerType.CARRIER_DEPOT, 34.1720, 132.2200),
@@ -97,7 +108,7 @@ ROSTER: tuple[CustomerSpec, ...] = (
     # --- 郊外GS（灯油比率が高くタンクが小さい → 在庫トリガーが頻繁に発火）
     CustomerSpec("c11", "周東SS", CustomerType.SUBURBAN_GS, 34.1020, 132.1360),
     CustomerSpec("c12", "錦町SS", CustomerType.SUBURBAN_GS, 34.3300, 132.0000),
-    CustomerSpec("c13", "玖珂SS", CustomerType.SUBURBAN_GS, 34.1380, 132.1240),
+    CustomerSpec("c13", "玖珂SS", CustomerType.SUBURBAN_GS, 34.1380, 132.1240, piping_inch=4),
     CustomerSpec("c14", "湯来SS", CustomerType.SUBURBAN_GS, 34.4720, 132.2560),
     CustomerSpec("c15", "吉和SS", CustomerType.SUBURBAN_GS, 34.4560, 132.1200),
 )
@@ -118,15 +129,13 @@ class TypeProfile:
 
     荷卸時間はここでは持たない。**降ろす量から決まる**（domain.unload_minutes）。
     以前は類型ごとの定数（30〜45分）を置いていて、2kL置くのも16kL置くのも
-    同じ時間になっていた。
+    同じ時間になっていた。配管の口径も類型では決まらない（系列の出自で決まる
+    ので、名簿の1軒ずつに持たせてある）。
     """
 
     window_open: str
     window_close: str
-    #: 荷卸しの実効口径（インチ）。**仮置。** 実務では需要家ごとに荷役条件の
-    #: マスターに載っている。ここでは「郊外の小さいSSは配管が3インチ」とだけ
-    #: 置いてある。どの先が3インチかは確認が取れていない。
-    bore_inch: int
+
     #: 油種 -> (タンク容量L, 平年の1日消費L)
     tanks: dict[Product, tuple[int, int]]
 
@@ -142,7 +151,6 @@ PROFILES: dict[CustomerType, TypeProfile] = {
     CustomerType.URBAN_GS_24H: TypeProfile(
         window_open="05:00",
         window_close="21:00",
-        bore_inch=4,
         tanks={
             Product.REGULAR: (15_000, 1_700),
             Product.PREMIUM: (5_000, 420),
@@ -153,7 +161,6 @@ PROFILES: dict[CustomerType, TypeProfile] = {
     CustomerType.URBAN_GS_DAY: TypeProfile(
         window_open="08:00",
         window_close="17:00",
-        bore_inch=4,
         tanks={
             Product.REGULAR: (12_000, 1_300),
             Product.PREMIUM: (4_000, 320),
@@ -164,7 +171,6 @@ PROFILES: dict[CustomerType, TypeProfile] = {
     CustomerType.SANIN_GS: TypeProfile(
         window_open="07:00",
         window_close="18:00",
-        bore_inch=4,
         tanks={
             Product.REGULAR: (12_000, 1_200),
             Product.GASOIL: (10_000, 1_000),
@@ -175,7 +181,6 @@ PROFILES: dict[CustomerType, TypeProfile] = {
     CustomerType.CARRIER_DEPOT: TypeProfile(
         window_open="05:00",
         window_close="08:30",
-        bore_inch=4,
         tanks={
             # 営業所は軽油だけ。まとまった量を、朝の出庫前に入れる。
             Product.GASOIL: (20_000, 2_200),
@@ -184,7 +189,6 @@ PROFILES: dict[CustomerType, TypeProfile] = {
     CustomerType.SUBURBAN_GS: TypeProfile(
         window_open="07:00",
         window_close="19:00",
-        bore_inch=3,
         tanks={
             Product.REGULAR: (8_000, 750),
             Product.GASOIL: (6_000, 550),
@@ -193,6 +197,25 @@ PROFILES: dict[CustomerType, TypeProfile] = {
         },
     ),
 }
+
+
+#: ローリーに積んでいる荷卸しホースの口径（インチ）。**実務。**
+#:
+#: 4インチと3インチの2種類があり、**3インチが多い**（2026-09-11 運送会社への
+#: 聞き取り）。乗務員の年齢が上がってきて、重い4インチのホースを避けるため。
+#:
+#: 荷卸しは自然落下で、経路の一番細いところが律速する。ホースが3インチなら
+#: 需要家の配管が4インチでも流量は3インチ相当になり、**流下はおよそ倍かかる**
+#: （4kLで5分 → 8分）。
+#:
+#: つまり乗務員の労働環境が設備の選択を決め、それが荷卸時間を通じて拘束時間と
+#: 必要台数に返ってくる。4インチに替えれば荷卸しは速くなるが、乗務員の負担が
+#: 増える。**体制の選択肢の1つ**として、ここを動かして比べられる。
+#:
+#: ただし4インチに替えて速くなるのは**配管も4インチの先（旧三菱系）だけ**。
+#: 旧日石系は配管が律速するので、ホースを替えても変わらない。替える価値が
+#: あるかは、配送先に旧三菱系がどれだけあるかで決まる。
+HOSE_INCH = 3
 
 
 #: 季節ごとの消費乗数。平年の季節差であって、寒波などの事象ではない。
@@ -355,7 +378,7 @@ def generate(
                     ACCEPTS_TRAILER[spec.type]
                     and spec.id not in RIGID_ONLY_CUSTOMERS
                 ),
-                bore_inch=profile.bore_inch,
+                bore_inch=min(HOSE_INCH, spec.piping_inch),
             )
         )
 

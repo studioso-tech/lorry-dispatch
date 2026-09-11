@@ -525,3 +525,79 @@ def test_break_location_risk_detects_stranded_trip():
     assert len(risk) == 1 and risk[0]["vehicle"] == "v1"
     # 4時間超 だが 高速に乗る → SA/PA が使える
     assert _break_location_risk(day(300), matrix(express), customers, 240) == []
+
+
+# ---------------------------------------------------------------------------
+# 再現性（SolveMode）
+# ---------------------------------------------------------------------------
+
+
+def test_reproducible_mode_never_sets_a_wall_clock_limit():
+    """REPRODUCIBLE では実時間の上限を置かない。並列数も固定する。
+
+    **「念のため」の安全網が決定性を壊した。** 決定的時間と実時間を両方
+    渡すと、実時間の側が探索に干渉し、同じ設定・同じマシンの2回で別の
+    計画が返った（2026-09-10）。善意で上限を足し直す変更をここで止める。
+
+    並列数を固定するのは、並列数が違えば探索が違い別の計画になるから。
+    環境変数（SOLVE_WORKERS）や vCPU 数に引きずられてはいけない。
+    """
+    from core.solver import (
+        DETERMINISTIC_BUDGET,
+        REPRODUCIBLE_WORKERS,
+        SolveMode,
+        _new_solver,
+    )
+
+    s = _new_solver(SolveMode.REPRODUCIBLE, time_limit_s=5.0, workers=2, seed=1, log=False)
+    assert s.parameters.max_time_in_seconds > 1e9, "再現モードに実時間の上限が入っている"
+    assert s.parameters.max_deterministic_time == DETERMINISTIC_BUDGET
+    assert s.parameters.interleave_search
+    assert s.parameters.num_workers == REPRODUCIBLE_WORKERS, "並列数が引数に引きずられている"
+
+    f = _new_solver(SolveMode.FAST, time_limit_s=5.0, workers=2, seed=1, log=False)
+    assert f.parameters.max_time_in_seconds == 5.0
+    assert f.parameters.num_workers == 2
+
+
+def _signature(plan):
+    """計画そのもの。どの車がどの軒をどの順で回るか。"""
+    return tuple(
+        (vd.vehicle_id, tuple(tuple(st.customer_id for st in t.stops) for t in vd.trips))
+        for vd in sorted(plan.vehicle_days, key=lambda x: x.vehicle_id)
+    )
+
+
+def _solve_reproducible(seed):
+    from core.solver import SolveMode
+
+    s = generate(seed=seed, season="winter")
+    s.vehicles = tuple(v for v in s.vehicles if v.id in {"v1", "v4", "v5"})
+    return solve(s, matrix=build_matrix(s.depot, s.customers), mode=SolveMode.REPRODUCIBLE)
+
+
+def test_reproducible_mode_returns_the_same_plan_twice():
+    """同じ入力を2回解いて、同じ計画が返ること。フラグもそう申告すること。"""
+    a = _solve_reproducible(20261015)
+    b = _solve_reproducible(20261015)
+    assert a.status in ("OPTIMAL", "FEASIBLE")
+    assert _signature(a) == _signature(b)
+    assert a.objective == b.objective
+    assert a.diagnostics["reproducible"] is True
+    assert a.diagnostics["reproducible_basis"] == "deterministic_search"
+
+
+@pytest.mark.slow
+@pytest.mark.timeout(900)
+def test_reproducible_mode_holds_without_an_optimality_proof():
+    """**最適性を証明できない日でも、同じ計画が返ること。** これが本丸。
+
+    seed 20261016（3台）は、実時間なら90秒かけても1段目の最適性を証明
+    できない日。以前の「両段が最適なら再現できる」では、この日は再現を
+    保証できなかった。探索量で打ち切れば、証明の有無と再現性は無関係になる。
+    """
+    a = _solve_reproducible(20261016)
+    b = _solve_reproducible(20261016)
+    assert _signature(a) == _signature(b)
+    assert a.objective == b.objective
+    assert a.diagnostics["tiebreak"] == b.diagnostics["tiebreak"]

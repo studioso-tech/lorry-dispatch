@@ -218,3 +218,33 @@ def test_bore_must_be_a_real_hose_size():
     c = generate(seed=1).customers[0]
     with pytest.raises(ValueError, match="口径"):
         replace(c, bore_inch=5)
+
+
+def test_bore_is_the_narrower_of_hose_and_piping():
+    """実効口径はホースと配管の細いほう（自然落下は一番細いところが律速する）。
+
+    ホースは3インチが多い（乗務員の負担を軽くするため）。配管は系列で決まり、
+    旧三菱系だけが4インチ。したがって:
+
+        3インチホース → 旧三菱系でも3インチ
+        4インチホース → 旧三菱系だけ4インチ、旧日石系は3インチのまま
+
+    **ホースを替えても旧日石系は速くならない。** ここが崩れると、4インチ
+    ホースに替える効果を過大に見積もる。
+    """
+    import core.generator as g
+    from core.generator import ROSTER
+
+    four = {spec.id for spec in ROSTER if spec.piping_inch == 4}
+    assert four, "配管4インチ（旧三菱系）の先が1軒も無い"
+    assert len(four) < len(ROSTER), "全軒が4インチ配管になっている"
+
+    original = g.HOSE_INCH
+    try:
+        g.HOSE_INCH = 3
+        assert {c.bore_inch for c in g.generate(seed=1).customers} == {3}
+        g.HOSE_INCH = 4
+        for c in g.generate(seed=1).customers:
+            assert c.bore_inch == (4 if c.id in four else 3), c.id
+    finally:
+        g.HOSE_INCH = original
