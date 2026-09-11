@@ -73,42 +73,47 @@ def test_winter_raises_kerosene_demand():
     assert kerosene_use(winter) > kerosene_use(summer) * 5
 
 
-def test_demand_covers_only_tanks_needing_topup():
-    """需要は「2日先に発注点を割るタンク」だけの合計。
+def test_planned_delivery_comes_every_three_operating_days():
+    """計画配送の先には、営業日で数えてほぼ3日に1回、決まった周期で運ぶ。
 
-    全タンクを毎日満タンにする定義にすると、1軒でローリー1台を使い切る
-    需要になり、車が何台あっても足りない計画が出る（v0 の最初の実装がこれ）。
+    以前は毎日「2日先に発注点を割るタンク」を満タンまで補充していて、
+    計画配送の量が日によってばらついていた。実態は月〜土ほぼ一定量。
     """
-    s = generate(seed=3, season="winter")
-    for c in s.customers:
-        if c.ordering:
-            continue   # 発注配送の先は発注量で決まる（別のテスト）
-        expected = sum(t.topup_l for t in c.tanks if t.needs_topup)
-        assert c.demand_l == expected
-        for t in c.tanks:
-            if not t.needs_topup:
+    import datetime
+
+    from core.generator import PLANNED_INTERVAL_DAYS
+
+    start = datetime.date(2026, 10, 12)          # 月曜
+    due: dict[str, list[int]] = {}
+    for k in range(21):
+        d = start + datetime.timedelta(days=k)
+        for c in generate(seed=k, date=d.isoformat(), season="winter").customers:
+            if c.ordering or not c.open_today:
                 continue
-            projected = t.level_l - t.daily_use_l * DELIVERY_LOOKAHEAD_DAYS
-            assert projected <= t.reorder_l
+            due.setdefault(c.id, [])
+            due[c.id].append(1 if c.planned else 0)
+    for cid, marks in due.items():
+        # 営業日だけを並べると、きっちり3日に1回
+        assert sum(marks) == len(marks) // PLANNED_INTERVAL_DAYS, cid
+        hits = [i for i, m in enumerate(marks) if m]
+        assert all(b - a == PLANNED_INTERVAL_DAYS for a, b in zip(hits, hits[1:])), cid
 
 
 def test_mandatory_depends_on_whose_promise_it_is():
-    """必須訪問は「誰の約束か」で決まる。
+    """必須訪問は「誰の約束か」で決まる。量が出る理由はどれも必須。
 
-        受入見送り  → 必須にしない（需要家の意思）
-        発注配送    → 発注があれば必須（需要家の約束）
-        計画配送    → 発注点割れで必須（運送会社側の約束）
-        どの先でも  → 欠品の直前なら必須
+        受入見送り・休業 → 必須にしない（行っても降ろせない）
+        計画配送の日     → 必須（運送会社側の約束）
+        発注             → 必須（需要家の約束）
+        欠品の直前       → 必須（元売の信用）
     """
     for seed in range(1, 11):
-        for c in generate(seed=seed, season="winter").customers:
+        s = generate(seed=seed, date=f"2026-10-{10 + seed:02d}", season="winter")
+        for c in s.customers:
             stockout = any(t.stockout_before_next_delivery and t.topup_l > 0 for t in c.tanks)
-            below = any(t.is_below_reorder and t.topup_l > 0 for t in c.tanks)
-            if c.ordering:
-                expected = bool(c.orders) or stockout
-            else:
-                expected = below or stockout
-            assert c.is_mandatory == (c.accepts_delivery and expected), c.id
+            reason = stockout or bool(c.orders) or bool(c.planned)
+            expected = c.accepts_delivery and c.open_today and c.demand_l > 0 and reason
+            assert c.is_mandatory == expected, c.id
 
 
 def test_ordering_customer_below_reorder_without_order_is_not_forced():
@@ -196,23 +201,75 @@ def test_absent_driver_removes_vehicle():
     assert len(s.usable_vehicles()) == len(s.vehicles) - 1
 
 
-def test_demand_fits_realistic_scale():
-    """1日の需要が車両総容量と同じ桁に収まっている。
+def test_deliveries_balance_what_is_sold():
+    """運ぶ量が売れる量と釣り合っていること。**売れる以上に運び続けることはできない。**
 
-    ここが桁違いだと、ソルバーが正しくても計画は毎日破綻する。
-    複数の seed で見るのは、たまたま緩い日を見て安心しないため。
+    以前の作り方（毎日「2日先に発注点を割るタンク」を満タンまで）は、名簿が
+    1日に売る47kL（冬）に対して毎日約140kLを運ぶ需要を出していた。約3倍に
+    膨らんだ需要の上で台数を数えていたことになる。2週間ならして、運ぶ量が
+    売れる量の±25%に入ることを確かめる。
     """
-    for seed in (1, 42, 777, 20261015):
-        s = generate(seed=seed, season="winter")
-        total = sum(c.demand_l for c in s.customers)
-        # 総需要は車両総容量の 1〜4 倍。1未満なら1日で片付いてしまい
-        # 配車の問題にならず、4倍を超えると何をしても回らない。
-        assert 1.0 <= total / s.fleet_capacity_l <= 4.0, (seed, total)
+    import datetime
+
+    from core.generator import CLOSED_ON_SUNDAY, ROSTER, _planned_daily
+
+    start = datetime.date(2026, 10, 12)
+    delivered = 0
+    sold = 0
+    for k in range(14):
+        d = start + datetime.timedelta(days=k)
+        s = generate(seed=100 + k, date=d.isoformat(), season="winter")
+        delivered += sum(c.demand_l for c in s.customers)
+        for spec in ROSTER:
+            if d.weekday() == 6 and CLOSED_ON_SUNDAY[spec.type]:
+                continue                                   # 休業日は売れない
+            sold += sum(_planned_daily(spec, "winter").values())
+    assert 0.75 <= delivered / sold <= 1.25, (delivered, sold)
 
 
-# ---------------------------------------------------------------------------
-# 荷卸時間（運送会社への聞き取り 2026-09-11）
-# ---------------------------------------------------------------------------
+def test_sunday_is_about_sixty_percent_of_a_weekday():
+    """日曜の配送量は平日の6割程度（実務）。休業のSSが多いため。"""
+    import datetime
+    import statistics
+
+    start = datetime.date(2026, 10, 12)
+    weekday, sunday = [], []
+    for k in range(56):
+        d = start + datetime.timedelta(days=k)
+        total = sum(
+            c.demand_l
+            for c in generate(seed=1000 + k, date=d.isoformat(), season="winter").customers
+        )
+        (sunday if d.weekday() == 6 else weekday).append(total)
+    ratio = statistics.mean(sunday) / statistics.mean(weekday)
+    assert 0.45 <= ratio <= 0.70, ratio
+
+
+def test_planned_volume_is_steady_monday_to_saturday():
+    """計画配送の量は月〜土でほぼ一定（実務）。発注は上に乗って振れる。"""
+    import datetime
+    import statistics
+
+    start = datetime.date(2026, 10, 12)
+    planned = []
+    for k in range(42):
+        d = start + datetime.timedelta(days=k)
+        if d.weekday() == 6:
+            continue
+        s = generate(seed=2000 + k, date=d.isoformat(), season="winter")
+        planned.append(sum(c.demand_l for c in s.customers if c.planned))
+    cv = statistics.pstdev(planned) / statistics.mean(planned)
+    # 名簿が15軒と小さいので、周期の起点の割り付けで±1〜2割の凸凹は残る
+    assert cv < 0.20, cv
+
+
+def test_closed_customers_get_nothing_on_sunday():
+    """日曜休業の先は、日曜に計画配送も発注も受けない。"""
+    s = generate(seed=1, date="2026-10-18", season="winter")      # 日曜
+    closed = [c for c in s.customers if not c.open_today]
+    assert closed, "日曜に休業の先が1軒も無い"
+    for c in closed:
+        assert c.demand_l == 0 and not c.is_mandatory and not c.declined_at_risk
 
 
 def test_unload_flow_matches_field_measurements():

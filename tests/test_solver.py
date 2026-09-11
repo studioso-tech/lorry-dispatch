@@ -217,8 +217,13 @@ def test_more_trips_serve_more_customers():
 
     1台1日1便では、全車が午前中に帰庫して以降ずっと空くのに、
     切れかけの需要家が残っていた。
+
+    車は単車2台（1便で計30kL）に絞る。需要を売れる量に見合わせてから
+    （1日40〜50kL）は、5台あれば1便でも全軒回れてしまい、便を増やす
+    意味が確かめられないため。
     """
     s = generate(seed=20261015, season="winter")
+    s.vehicles = tuple(v for v in s.vehicles if v.id in {"v4", "v5"})
     m = build_matrix(s.depot, s.customers)
     one = solve(s, matrix=m, time_limit_s=30.0, max_trips=1)
     two = solve(s, matrix=m, time_limit_s=45.0, max_trips=2)
@@ -539,8 +544,9 @@ def test_reproducible_mode_never_sets_a_wall_clock_limit():
     渡すと、実時間の側が探索に干渉し、同じ設定・同じマシンの2回で別の
     計画が返った（2026-09-10）。善意で上限を足し直す変更をここで止める。
 
-    並列数を固定するのは、並列数が違えば探索が違い別の計画になるから。
-    環境変数（SOLVE_WORKERS）や vCPU 数に引きずられてはいけない。
+    **並列探索も決定性を壊した。** 8本＋interleave_search で、重い日に同じ
+    入力から目的値は同じで中身の違う計画が返った（2026-09-11）。速くしたくて
+    並列に戻す変更もここで止める。
     """
     from core.solver import (
         DETERMINISTIC_BUDGET,
@@ -549,11 +555,12 @@ def test_reproducible_mode_never_sets_a_wall_clock_limit():
         _new_solver,
     )
 
-    s = _new_solver(SolveMode.REPRODUCIBLE, time_limit_s=5.0, workers=2, seed=1, log=False)
+    s = _new_solver(SolveMode.REPRODUCIBLE, time_limit_s=5.0, workers=8, seed=1, log=False)
     assert s.parameters.max_time_in_seconds > 1e9, "再現モードに実時間の上限が入っている"
     assert s.parameters.max_deterministic_time == DETERMINISTIC_BUDGET
-    assert s.parameters.interleave_search
-    assert s.parameters.num_workers == REPRODUCIBLE_WORKERS, "並列数が引数に引きずられている"
+    assert s.parameters.num_workers == REPRODUCIBLE_WORKERS == 1, (
+        "再現モードが並列で探索している。並列探索は重い日に決定的でなかった"
+    )
 
     f = _new_solver(SolveMode.FAST, time_limit_s=5.0, workers=2, seed=1, log=False)
     assert f.parameters.max_time_in_seconds == 5.0
@@ -588,16 +595,42 @@ def test_reproducible_mode_returns_the_same_plan_twice():
 
 
 @pytest.mark.slow
-@pytest.mark.timeout(900)
-def test_reproducible_mode_holds_without_an_optimality_proof():
+@pytest.mark.timeout(1200)
+def test_reproducible_mode_holds_without_an_optimality_proof(monkeypatch):
     """**最適性を証明できない日でも、同じ計画が返ること。** これが本丸。
 
-    seed 20261016（3台）は、実時間なら90秒かけても1段目の最適性を証明
-    できない日。以前の「両段が最適なら再現できる」では、この日は再現を
-    保証できなかった。探索量で打ち切れば、証明の有無と再現性は無関係になる。
+    現実の需要の日は軽く、数秒で最適性の証明まで届いてしまう。それでは
+    「証明できたから一致した」のか「探索量で打ち切ったから一致した」のかが
+    区別できない。そこで**全15軒が同じ日に満タン補充を求める重い日**（需要
+    約95kL、現実の2倍）を組み立て、探索量も絞って、証明が終わる前に打ち切る。
+
+    この日で、並列8本の探索は目的値が同じまま中身の違う計画を返した
+    （2026-09-11）。単スレッドにしてからは一致する。
+
+    **証明できていないことも確かめる。** 需要や解き方が変わって証明できて
+    しまうと、このテストは何も守らなくなる（一度そうなった）。
     """
-    a = _solve_reproducible(20261016)
-    b = _solve_reproducible(20261016)
+    from dataclasses import replace
+
+    import core.solver as sv
+
+    monkeypatch.setattr(sv, "DETERMINISTIC_BUDGET", 10.0)
+
+    def heavy():
+        s = generate(seed=20261016, date="2026-10-15", season="winter")
+        s.customers = tuple(
+            replace(c, orders=(), planned=tuple((t.product, t.topup_l) for t in c.tanks if t.topup_l > 0))
+            for c in s.customers
+        )
+        s.vehicles = tuple(v for v in s.vehicles if v.id in {"v1", "v4", "v5"})
+        return sv.solve(s, matrix=build_matrix(s.depot, s.customers), mode=sv.SolveMode.REPRODUCIBLE)
+
+    a = heavy()
+    b = heavy()
+    d = a.diagnostics
+    assert not (d["phase1_status"] == "OPTIMAL" and d["phase2_status"] == "OPTIMAL"), (
+        "重い日のはずが最適性を証明できてしまった。このテストは何も確かめていない"
+    )
     assert _signature(a) == _signature(b)
     assert a.objective == b.objective
     assert a.diagnostics["tiebreak"] == b.diagnostics["tiebreak"]

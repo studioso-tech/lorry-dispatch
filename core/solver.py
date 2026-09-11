@@ -79,10 +79,24 @@ from core.travel import TravelMatrix, build_matrix
 # 「この需要家を回るために何分の遠回りまで許すか」で読める形にしてある。
 # ---------------------------------------------------------------------------
 
-#: 必須訪問（発注・計画配送の発注点割れ・欠品の直前）を落としたときの罰。実質的な禁止。
+#: 必須訪問を落としたときの罰。実質的な禁止。
 #: それでも有限にしてあるのは、**解無しで黙るより「3軒回れなかった」と
 #: 言えるほうが役に立つ**から。エージェントはこれを読んで代替案を出す。
 PENALTY_MANDATORY_MIN = 100_000
+
+#: 必須訪問の理由ごとの罰。**車が足りずにどれかを落とすときの優先順位。**
+#:
+#:     欠品の直前  元売の信用。最後まで落とさない
+#:     発注        需要家の約束
+#:     計画配送    運送会社側の都合。1日ずらせる
+#:
+#: 同じ重さにしておくと、落とす先を「回るのが遠い順」に選んでしまい、
+#: 発注を守らずに計画配送を回す計画が出うる。
+PENALTY_BY_BASIS: dict[str, int] = {
+    "stockout": 3 * PENALTY_MANDATORY_MIN,
+    "order": 2 * PENALTY_MANDATORY_MIN,
+    "planned": PENALTY_MANDATORY_MIN,
+}
 
 #: 任意訪問を落としたときの罰の基準値。240分＝「4時間の遠回りまでなら
 #: 今日ついでに回ったほうが得」という判断。
@@ -135,16 +149,22 @@ class SolveMode(str, Enum):
 #: REPRODUCIBLE の探索量（CP-SAT の決定的時間、1段あたり）。
 #:
 #: 実時間ではない。同じ値なら、どのマシンでも同じだけ探索して同じ場所で
-#: 止まる。3台・冬の測定では 60 で実時間10〜110秒（解きやすい日は10秒で
-#: 最適性の証明まで届き、難しい日は証明しないまま同じ計画で止まる）。
+#: 止まる。解きやすい日は予算に届く前に最適性の証明まで終わる（現実の
+#: 需要の日はほぼこれ）。難しい日は証明しないまま、同じ計画で止まる。
 DETERMINISTIC_BUDGET = 60.0
 
-#: REPRODUCIBLE の並列数。**環境変数や vCPU 数に合わせて変えてはいけない。**
+#: REPRODUCIBLE の並列数。**1（単スレッド）。増やしてはいけない。**
 #:
-#: 並列数が違えば探索が違い、別の計画になる。Cloud Run が4 vCPU でも、
-#: 審査員の手元が16コアでも、ここは同じ値で走らせる（コアが少なければ
-#: 実時間が延びるだけで、結果は変わらない）。
-REPRODUCIBLE_WORKERS = 8
+#: 最初は8本の並列探索に interleave_search（決定的な並列探索）を付けて
+#: いたが、**重い日には決定的でなかった**（2026-09-11 測定）。需要95kLの
+#: 試験の日で、同じ入力を2回解くと目的値は同じ3273なのに中身の計画が違った。
+#: 軽い日に一致していたのは、最適解がほぼ1つに絞られていたからにすぎない。
+#:
+#: 単スレッドなら別プロセスで2回解いても完全に一致した（タイブレーク値まで）。
+#: 主目的の値も8本と同じで、計画の質は落ちなかった。代償は重い日の実時間
+#: （上の試験の日で5〜6分）。現実の需要の日は1週間すべて0〜14秒で最適性の
+#: 証明まで届く。
+REPRODUCIBLE_WORKERS = 1
 
 # 2段目を速くする試みで、**採らなかった**案を2つ記録しておく。どちらも
 # 一度は良さそうに見えたので、次に同じ道を通らないために残す。
@@ -166,7 +186,9 @@ REPRODUCIBLE_WORKERS = 8
 #
 # ---
 #
-# 案C（2026-09-10 に測定、2026-09-11 に SolveMode として実装）:
+# 案C（2026-09-10 に測定、2026-09-11 に SolveMode として実装。
+# **同日、並列探索も決定性を壊すことが分かり単スレッドに改めた**。
+# 下の記録のうち「並列8本で3回一致」は軽い日でしか成り立たなかった）:
 #
 # 案Aが失敗したのは、決定的時間の予算が小さすぎたことに加えて、
 # **実時間の上限を併置していたから**だった。両方を渡すと、決定的時間で
@@ -450,8 +472,9 @@ def _new_solver(
     s.parameters.log_search_progress = log
     s.parameters.random_seed = seed % 2_147_483_647
     if mode is SolveMode.REPRODUCIBLE:
+        # 単スレッド＋探索量の上限。並列探索は（interleave_search を付けても）
+        # 重い日に決定的でなかったので使わない。REPRODUCIBLE_WORKERS の説明を参照。
         s.parameters.num_workers = REPRODUCIBLE_WORKERS
-        s.parameters.interleave_search = True
         s.parameters.max_deterministic_time = DETERMINISTIC_BUDGET
         # max_time_in_seconds は既定（無制限）のまま。**置かない。**
     else:
@@ -865,7 +888,10 @@ def solve(
     # --- 目的関数 ----------------------------------------------------------
     penalties = []
     for c_idx, c in enumerate(customers):
-        p = PENALTY_MANDATORY_MIN if c.is_mandatory else _optional_penalty(c)
+        # 任意訪問（_optional_penalty）はいまの需要の作り方では出てこない
+        # （量が出るのは計画配送・発注・欠品の直前だけで、どれも必須）。
+        # 空いた車で翌日ぶんを前倒しする配送を入れるときの受け皿として残す。
+        p = PENALTY_BY_BASIS[c.mandatory_basis] if c.is_mandatory else _optional_penalty(c)
         if p:
             penalties.append(p * (1 - served[c_idx]))
 

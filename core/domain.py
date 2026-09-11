@@ -350,6 +350,15 @@ class Customer:
     #: 前日までに受けた発注（油種, L）。**需要家の約束**なので必須訪問になる。
     orders: tuple[tuple["Product", int], ...] = ()
 
+    #: 今日の計画配送（油種, L）。**運送会社側の約束。** 計画配送の先は
+    #: 決まった周期（ほぼ3日に1回）で、消費量に見合った量を運ぶ。今日が
+    #: その日でなければ空。
+    planned: tuple[tuple["Product", int], ...] = ()
+
+    #: 今日営業しているか。日曜休業のSSは日曜に受けられない（無人荷卸しが
+    #: 無い前提）。見送り（accepts_delivery）とは別物で、警告の対象にしない。
+    open_today: bool = True
+
     #: 今日の受入を受けるか。**需要家の意思。**
     #:
     #: 値下げ前には在庫を下げたがって受入を見送る（安い油が来る前に高い
@@ -381,40 +390,42 @@ class Customer:
 
     @property
     def is_mandatory(self) -> bool:
-        """必須訪問か。**誰の約束かで決める。**
+        """必須訪問か。**誰の約束かで決める。** 理由は mandatory_basis。
 
-            受入見送り  → 必須にしない（行っても降ろせない。需要家の意思）
-            発注配送    → 発注があれば必須（需要家の約束）
-            計画配送    → 発注点割れで必須（**運送会社側の約束**）
-            どの先でも  → 欠品の直前なら必須（今日行かないと明日より先に空になる）
+            受入見送り・休業  → 必須にしない（行っても降ろせない）
+            計画配送の日      → 必須（運送会社側の約束）
+            発注がある        → 必須（需要家の約束）
+            欠品の直前        → 必須（今日行かないと明日の配送より先に空になる）
 
-        以前は「1本でも発注点を割っていれば必須」で、受入見送りも発注配送も
-        区別していなかった。それだと値下げ前に在庫を意図的に下げている
-        需要家へ、**断られても配車する**計画が出る。
+        以前は「1本でも発注点を割っていれば必須」で、需要家の意思を見て
+        いなかった。値下げ前に在庫を意図的に下げて受入を見送る需要家へ、
+        **断られても配車する**計画が出ていた。
 
-        一方で、発注点割れを一律に任意訪問へ落とすのも誤りだった（2026-09-11
-        に試して撤回）。計画配送の先は「需要見込みで運ぶ」と運送会社が
-        引き受けている先なので、発注点を割らせないのはこちらの責任になる。
-        任意にすると、在庫あと1.5日の先を「車を1台増やすより明日に回すほうが
-        安い」と判断して落とした。1日だけを見るモデルには、翌日その先が
-        欠品寸前になるコストが見えない。
-
-        在庫が需要家の意思を代理できないのは、**需要家が意思を示した先**
-        （見送り・発注配送）に限る。
+        発注点割れを一律に任意訪問へ落とす案は試して撤回した（2026-09-11）。
+        罰が軽くなり、在庫あと1.5日の先を「車を1台増やすより明日に回すほうが
+        安い」と判断して落とした。いまは計画配送が周期で決まっているので、
+        発注点割れを待たずに運ぶ日が先に決まる。
         """
         return self.mandatory_basis is not None
 
     @property
     def mandatory_basis(self) -> str | None:
-        """必須にする理由。order / planned / stockout / None。説明文と診断が使う。"""
-        if not self.accepts_delivery:
+        """必須にする理由。強い順に stockout / order / planned。無ければ None。
+
+        この順は、車が足りずにどれかを落とすときの優先順位でもある
+        （solver.PENALTY_BY_BASIS）。欠品は元売の信用、発注は需要家の約束、
+        計画配送は運送会社側の都合で1日ずらせる。
+        """
+        if not self.accepts_delivery or not self.open_today:
             return None
-        if self.orders:
-            return "order"
-        if not self.ordering and any(t.is_below_reorder and t.topup_l > 0 for t in self.tanks):
-            return "planned"
+        if self.demand_l <= 0:
+            return None
         if any(t.stockout_before_next_delivery and t.topup_l > 0 for t in self.tanks):
             return "stockout"
+        if self.orders:
+            return "order"
+        if self.planned:
+            return "planned"
         return None
 
     @property
@@ -431,28 +442,27 @@ class Customer:
     def demand_by_product(self) -> dict[Product, int]:
         """今日この需要家に降ろす量（油種ごと）。
 
-            受入見送り  → 何も降ろさない
-            発注の油種  → 発注量（入りきらない分は降ろせないので空き容量まで）
-            欠品の直前  → 空き容量まで（発注の有無によらない。欠品は最上位）
-            計画配送    → 2日先までに発注点を割るタンクを空き容量まで
-                          （Tank.needs_topup。余裕のあるタンクは触らない）
+            受入見送り・休業  → 何も降ろさない
+            計画配送の日      → 計画量（入りきらない分は降ろせないので空き容量まで）
+            発注の油種        → 発注量（同上）
+            欠品の直前        → 空き容量まで（発注・計画の有無によらない）
 
-        発注配送の先で発注の無い油種は、欠品の直前でない限り触らない。
-        何を入れるかは需要家が決めているため。
+        同じ油種に計画と発注が重なったら大きいほう（タンクは1本なので、
+        足しても空き容量を超えては入らない）。
         """
-        if not self.accepts_delivery:
+        if not self.accepts_delivery or not self.open_today:
             return {}
         ordered = dict(self.orders)
+        planned = dict(self.planned)
         out: dict[Product, int] = {}
         for t in self.tanks:
+            q = 0
             if t.product in ordered:
-                q = min(ordered[t.product], t.topup_l)
-            elif t.stockout_before_next_delivery:
+                q = max(q, min(ordered[t.product], t.topup_l))
+            if t.product in planned:
+                q = max(q, min(planned[t.product], t.topup_l))
+            if t.stockout_before_next_delivery:
                 q = t.topup_l
-            elif not self.ordering and t.needs_topup:
-                q = t.topup_l
-            else:
-                q = 0
             if q > 0:
                 out[t.product] = out.get(t.product, 0) + q
         return out

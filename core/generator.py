@@ -12,8 +12,10 @@
 何を固定し、何を振るか:
     - 固定: 需要家の顔ぶれ・座標・類型・受入時間枠・タンク容量
       → 地図が日によって変わらない。等時線マップ（W5）の見え方が安定する。
-    - 振る: 当日の在庫水準・消費量のばらつき
-      → 「今日どこが切迫しているか」が日替わりになり、再計画の意味が出る。
+    - 周期で決まる: 計画配送の日と量、在庫水準（前回の配送からの経過日数）
+      → 計画配送は月〜土でほぼ一定量になる（実務）。日付を変えると周期が進む。
+    - 振る: 消費の日々の揺れ、発注配送の先が頼む日
+      → 発注が「計画配送の上に乗る、振れる部分」になる。
 
     seed を変えれば別の日が出る。seed が同じなら完全に同じ日が出る。
     これは回帰テスト（W6）の前提であり、シードを固定しない生成は禁止。
@@ -27,6 +29,7 @@
 
 from __future__ import annotations
 
+import datetime
 import random
 from dataclasses import dataclass
 
@@ -225,6 +228,35 @@ PROFILES: dict[CustomerType, TypeProfile] = {
 HOSE_INCH = 3
 
 
+#: 計画配送の周期（営業日）。**ほぼ3日に1回**（実務）。
+#:
+#: SSの月間売上はある程度一定で、たとえば月100kL売る先は稼働25日で
+#: 1日4kL、それを3日に1回まとめて運ぶ（1回12kL前後）。名簿の冬の消費量
+#: では、どの先のどのタンクも3日ぶんが空き容量に収まる（3.1日以上もつ）。
+PLANNED_INTERVAL_DAYS = 3
+
+#: 日々の消費の揺れ（計画量に対する標準偏差の比）。**仮置。**
+#:
+#: 月の売上がほぼ一定なので、揺れは小さい。冬の灯油は気温との相関が高いが、
+#: 寒波という**事象**はシグナルで与えるので、ここには平時の揺れだけを置く。
+CONSUMPTION_NOISE = 0.12
+
+#: 日曜に休業する類型。休業日は売れないので消費もしない。**仮置。**
+#:
+#: 日曜の配送量は平日の6割程度（実務）。運送会社営業所と郊外GSを休業に
+#: すると、計算上の日曜の計画配送は平日の5〜6割になる。
+CLOSED_ON_SUNDAY: dict[CustomerType, bool] = {
+    CustomerType.URBAN_GS_24H: False,
+    CustomerType.URBAN_GS_DAY: False,
+    CustomerType.SANIN_GS: False,
+    CustomerType.CARRIER_DEPOT: True,
+    CustomerType.SUBURBAN_GS: True,
+}
+
+#: 周期を数える起点（日曜）。どの日付でも同じ周期の位置が出るように固定する。
+EPOCH = datetime.date(2026, 1, 4)
+
+
 #: 季節ごとの消費乗数。平年の季節差であって、寒波などの事象ではない。
 #: 灯油が冬に跳ね、夏はほぼ止まる。ガソリンは夏の行楽で少し伸びる。
 SEASON_MULTIPLIER: dict[str, dict[Product, float]] = {
@@ -304,48 +336,85 @@ RIGID_ONLY_CUSTOMERS: frozenset[str] = frozenset({"c08"})   # 岩国装束運輸
 # ---------------------------------------------------------------------------
 
 
-def _make_tanks(
-    rng: random.Random, ctype: CustomerType, season: str
-) -> tuple[Tank, ...]:
-    """1軒ぶんのタンクを作る。
-
-    在庫水準の振り方に意図がある。一様乱数で振ると、必須訪問（発注点割れ）の
-    数が日によって 0 軒から 12 軒まで暴れ、デモにならない日が混ざる。
-    ここでは「大半は余裕、一部が切迫」という現場の姿になるよう、
-    残量比を三角分布（下側に裾）で振っている。
-    """
-    profile = PROFILES[ctype]
+def _planned_daily(spec: CustomerSpec, season: str) -> dict[Product, int]:
+    """計画配送で見込む1日の消費（油種ごと）。元売の需要見込みにあたる。"""
     mult = SEASON_MULTIPLIER[season]
-    reorder_ratio = REORDER_RATIO[ctype]
+    return {
+        p: int(round(base_use * mult[p]))
+        for p, (_cap, base_use) in PROFILES[spec.type].tanks.items()
+    }
 
+
+def _phases(season: str) -> dict[str, int]:
+    """計画配送の先ごとに、周期の起点をどこに置くか。
+
+    **日々の合計がならされるように割り付ける。** 3日周期の先を全部同じ日に
+    置くと、その日だけ3倍になる。消費の大きい先から順に、いちばん軽い
+    起点へ入れていく（大きいものから詰める均し方）。
+
+    日曜休業の先と毎日営業の先は、営業日の数え方が違う（6日と7日）ので、
+    別々に均す。休業の先は営業日6日÷3日＝週2回で、曜日が固定される
+    （月木・火金・水土のいずれか）。
+    """
+    phases: dict[str, int] = {}
+    for closed in (False, True):
+        group = [
+            spec for spec in ROSTER
+            if not spec.ordering and CLOSED_ON_SUNDAY[spec.type] == closed
+        ]
+        group.sort(key=lambda spec: (-sum(_planned_daily(spec, season).values()), spec.id))
+        load = [0] * PLANNED_INTERVAL_DAYS
+        for spec in group:
+            k = min(range(PLANNED_INTERVAL_DAYS), key=lambda i: (load[i], i))
+            phases[spec.id] = k
+            load[k] += sum(_planned_daily(spec, season).values())
+    return phases
+
+
+def _operating_day(n: int, closed_sunday: bool) -> tuple[int, bool]:
+    """起点からの日数 n を、その需要家の営業日の通し番号に直す。
+
+    Returns:
+        (通し番号, 今日営業しているか)。休業日は「次の営業日」の番号を返す。
+        休業日は売れないので、次の営業日の朝と在庫が同じになるため。
+    """
+    if not closed_sunday:
+        return n, True
+    sundays = n // 7 + 1                 # 起点（日曜）から今日までの日曜の数
+    if n % 7 == 0:
+        return n - sundays + 1, False
+    return n - sundays, True
+
+
+def _cycle_tanks(
+    rng: random.Random, spec: CustomerSpec, season: str, days_since: int
+) -> tuple[Tank, ...]:
+    """計画配送の先のタンク。**在庫は周期から決まる。**
+
+    前回の配送で満タン近く（空き容量の安全代を残す）まで入れ、そこから
+    days_since 営業日ぶん売れた、とする。以前は在庫を三角分布の乱数で
+    振っていたが、それだと計画配送の量まで日によってばらつき、「月〜土は
+    ほぼ一定量」という実態から外れていた。揺れは消費の日々の揺れだけ。
+    """
+    profile = PROFILES[spec.type]
+    daily = _planned_daily(spec, season)
+    reorder_ratio = REORDER_RATIO[spec.type]
     tanks = []
-    for product, (capacity, base_use) in profile.tanks.items():
-        daily_use = int(round(base_use * mult[product]))
-        # 残量比: 最頻値0.42、下限0.08、上限0.85。下側に裾があるので
-        # 「今日切迫している軒」が毎日いくらか出る。
-        ratio = rng.triangular(0.08, 0.85, 0.42)
-        level = int(round(capacity * ratio))
+    for product, (capacity, _base) in profile.tanks.items():
+        ullage = int(round(capacity * ULLAGE_RATIO))
+        factor = max(0.0, rng.gauss(1.0, CONSUMPTION_NOISE))
+        sold = int(round(daily[product] * days_since * factor))
         tanks.append(
             Tank(
                 product=product,
                 capacity_l=capacity,
-                level_l=level,
+                level_l=max(0, capacity - ullage - sold),
                 reorder_l=int(round(capacity * reorder_ratio)),
-                daily_use_l=daily_use,
-                ullage_margin_l=int(round(capacity * ULLAGE_RATIO)),
+                daily_use_l=daily[product],
+                ullage_margin_l=ullage,
             )
         )
     return tuple(tanks)
-
-
-def _make_orders(tanks: tuple[Tank, ...]) -> tuple[tuple[Product, int], ...]:
-    """発注配送の先が前日に出す発注。
-
-    需要家は自分の在庫を見て、2日先までに発注点を割る油種を満タン近くまで
-    頼む、とした。**乱数を使わない**ので、発注配送の先を増減しても同じ
-    seed の在庫は変わらない。
-    """
-    return tuple((t.product, t.topup_l) for t in tanks if t.needs_topup)
 
 
 def generate(
@@ -389,11 +458,49 @@ def generate(
         raise ValueError(f"名簿に無い需要家: {unknown}")
 
     rng = random.Random(seed)
+    n = (datetime.date.fromisoformat(date) - EPOCH).days
+    phases = _phases(season)
 
     customers = []
     for spec in ROSTER:
         profile = PROFILES[spec.type]
-        tanks = _make_tanks(rng, spec.type, season)
+        op, open_today = _operating_day(n, CLOSED_ON_SUNDAY[spec.type])
+        planned: tuple[tuple[Product, int], ...] = ()
+        if spec.ordering:
+            # 発注配送の先: 自分の在庫を見て不定期に頼む。**計画配送の一定量の
+            # 上に乗る、振れる部分**にあたる。
+            #
+            # 在庫の減り方は計画配送の先と同じ（消費に見合う）で、違うのは
+            # **頼む日が決まっていない**こと。周期のどこにいるかを日ごとに振り、
+            # 周期の終わりに当たった日に3日ぶんを頼む。平均すれば消費量どおり、
+            # 日ごとには振れる。
+            #
+            # 最初は在庫を乱数で振り「2日先に発注点を割るなら発注」としたが、
+            # 1日2.2kLしか使わない営業所が毎日15kLずつ頼み、発注が計画配送より
+            # 大きくなった。量が消費と釣り合わない在庫の作り方は使えない。
+            days_since = rng.randint(1, PLANNED_INTERVAL_DAYS)
+            tanks = _cycle_tanks(rng, spec, season, days_since)
+            orders = (
+                tuple((t.product, t.topup_l) for t in tanks if t.topup_l > 0)
+                if open_today and days_since == PLANNED_INTERVAL_DAYS else ()
+            )
+        else:
+            # 計画配送の先: 周期（ほぼ3日に1回）で運ぶ。今日が何日目かで在庫と
+            # 計画量が決まる。周期の途中で発注点を割ったら、需要家から発注が入る
+            # （計画配送の上に発注を乗せる、の実際の形）。
+            phase = phases[spec.id]
+            days_since = ((op - phase - 1) % PLANNED_INTERVAL_DAYS) + 1
+            due = open_today and (op - phase) % PLANNED_INTERVAL_DAYS == 0
+            tanks = _cycle_tanks(rng, spec, season, days_since)
+            if due:
+                daily = _planned_daily(spec, season)
+                planned = tuple(
+                    (p, daily[p] * PLANNED_INTERVAL_DAYS) for p in daily if daily[p] > 0
+                )
+            orders = (
+                tuple((t.product, t.topup_l) for t in tanks if t.is_below_reorder)
+                if open_today and not due else ()
+            )
         customers.append(
             Customer(
                 id=spec.id,
@@ -410,7 +517,9 @@ def generate(
                 ),
                 bore_inch=min(HOSE_INCH, spec.piping_inch),
                 ordering=spec.ordering,
-                orders=_make_orders(tanks) if spec.ordering else (),
+                orders=orders,
+                planned=planned,
+                open_today=open_today,
                 accepts_delivery=spec.id not in declined_customers,
             )
         )

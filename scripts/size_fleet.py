@@ -30,10 +30,9 @@
     在庫水準は日替わりなので、切迫する軒数も日によって変わる。
     複数日の**最悪の日**で足りる台数でないと、その日に欠品する。
 
-    **本来の単位は1週間。** 体制が曜日の周期で固定される以上、日曜だけを
-    見れば少ない台数で足りるが、それでは月曜が回らない。いまの掃引は
-    曜日を持たない「N日ぶん」を見ているので、**ここはまだ正しくない**
-    （生成器が曜日で需要を動かせないため。docs/業務前提.md §5.2）。
+    **単位は1週間。** 計画配送は3日周期で月〜土ほぼ一定、日曜は休業の先が
+    あって減る。日曜だけを見れば少ない台数で足りるが、それでは平日が回らない。
+    既定で月曜から7日ぶんを見る。
 
 使い方:
     python -m scripts.size_fleet
@@ -44,6 +43,7 @@
 from __future__ import annotations
 
 import argparse
+import datetime
 import sys
 from dataclasses import dataclass
 from pathlib import Path
@@ -93,7 +93,7 @@ class DayResult:
         return self.max_duty_min >= self.max_duty_cap_min * DUTY_TIGHT_RATIO
 
 
-def evaluate(fleet_size: int, seeds, season: str, time_limit: float) -> list[DayResult]:
+def evaluate(fleet_size: int, days, season: str, time_limit: float) -> list[DayResult]:
     """その台数で、各日が回るかを見る。
 
     掃引ではコストと実行可能性しか要らないので tiebreak_phase=False。
@@ -101,8 +101,8 @@ def evaluate(fleet_size: int, seeds, season: str, time_limit: float) -> list[Day
     """
     keep = set(ADD_ORDER[:fleet_size])
     out: list[DayResult] = []
-    for seed in seeds:
-        s = generate(seed=seed, season=season)
+    for seed, date in days:
+        s = generate(seed=seed, date=date, season=season)
         s.vehicles = tuple(v for v in s.vehicles if v.id in keep)
         m = build_matrix(s.depot, s.customers)
         p = solve(
@@ -133,14 +133,21 @@ def main() -> int:
     ap.add_argument(
         "--season", default="winter", choices=["winter", "spring", "summer", "autumn"]
     )
-    ap.add_argument("--days", type=int, default=5, help="見る日数（需要のばらつき）")
+    ap.add_argument(
+        "--days", type=int, default=7,
+        help="見る日数。既定は1週間（計画配送の周期と日曜の減りが入る）",
+    )
+    ap.add_argument("--start", default="2026-10-12", help="初日（既定は月曜）")
     ap.add_argument("--time-limit", type=float, default=60.0)
     ap.add_argument("--max-fleet", type=int, default=len(FLEET))
     args = ap.parse_args()
 
+    start = datetime.date.fromisoformat(args.start)
+    dates = [(start + datetime.timedelta(days=i)).isoformat() for i in range(args.days)]
     seeds = [20261015 + i for i in range(args.days)]
+    days = list(zip(seeds, dates))
 
-    print(f"需要想定: {args.season} / {args.days}日ぶん（seed {seeds[0]}〜{seeds[-1]}）")
+    print(f"需要想定: {args.season} / {dates[0]}〜{dates[-1]}（{args.days}日）")
     print(f"名簿: 重要家15軒（麻里布油槽所の配送圏）\n")
     print(f"{'台数':>4} {'欠品ゼロ':>9} {'回れた軒':>9} {'総走行':>9} "
           f"{'最長拘束':>9} {'便':>4} {'最適性':>7}")
@@ -148,7 +155,7 @@ def main() -> int:
 
     answer = None
     for size in range(1, args.max_fleet + 1):
-        rows = evaluate(size, seeds, args.season, args.time_limit)
+        rows = evaluate(size, days, args.season, args.time_limit)
         ok_days = sum(1 for r in rows if r.ok)
         served = sum(r.served for r in rows) / len(rows)
         km = sum(r.total_km for r in rows) / len(rows)
