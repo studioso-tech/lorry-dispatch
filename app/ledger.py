@@ -111,6 +111,7 @@ ESTIMATES: dict[str, float] = {
     "explain": 0.020,        # 計画の理由説明・代替案の提示（medium。入力が長い）
     "draft": 0.022,          # 対外ドラフトの起草（medium。出力も長い）
     "absorb": 0.008,         # 配車係の手直しを制約として取り込む（low）
+    "intake": 0.010,         # FAX・メモからの当日発注の読み取り（low。画像1枚）
 }
 
 #: 操作ごとの思考レベル。**既定の medium に任せない。**
@@ -122,6 +123,7 @@ THINKING_LEVEL: dict[str, str] = {
     "explain": "medium",
     "draft": "medium",
     "absorb": "low",
+    "intake": "low",
 }
 
 #: 求解そのものは無料。OR-Tools は Cloud Run 上で動くだけで従量課金がない。

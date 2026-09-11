@@ -21,8 +21,11 @@ import uuid
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel, Field
 
-from app import ledger
+import base64
+
+from app import escapes, intake, ledger
 from app.config import settings
+from app.meter import CostMeter
 from core.domain import minutes_to_hhmm
 from core.generator import generate
 from core.domain import Product
@@ -345,65 +348,44 @@ class ReplanRequest(PlanRequest):
     spot_standby: int = Field(default=0, ge=0, le=10, description="いま呼べる待機の非専属の台数")
 
 
-@app.post("/api/replan")
-def make_replan(req: ReplanRequest) -> dict:
-    """朝の計画に、当日の発注を差し込んで組み直す。
+def _replan_body(req: PlanRequest, now: str, orders: list[NewOrder], spot_standby: int,
+                 *, dry_run: bool, plan_id: str) -> dict:
+    """朝の計画を再現モードで組み直し、当日の発注を差し込む。
 
-    朝の計画は**再現モードで組み直す**。審査員が /api/plan で見た朝の計画と
+    朝の計画を**再現モードで組み直す**のは、審査員が /api/plan で見た朝の計画と
     必ず同じものを土台にするため（再現モードは同じ入力から同じ計画を返す）。
     組み直しそのものは即応モード（時間で打ち切る）。
+
+    試算（dry_run）でなければ、使った逃げ道を記録する（恒常化の監視が数える）。
     """
-    plan_id = uuid.uuid4().hex[:12]
-    started = time.monotonic()
-    try:
-        amount = ledger.reserve(req.subject, "solve")
-    except ledger.BudgetExceeded as exc:
-        raise HTTPException(status_code=429, detail=str(exc)) from exc
-
-    try:
-        scenario = generate(
-            seed=req.seed,
-            date=req.date,
-            season=req.season,
-            absent_drivers=tuple(req.absent_drivers),
-            declined_customers=tuple(req.declined_customers),
-        )
-        orders = [
-            NewOrder(o.customer_id, o.product, o.volume_l, o.source, o.evidence_ref)
-            for o in req.orders
-        ]
-        base = solve(
-            scenario,
-            matrix=build_matrix(scenario.depot, scenario.customers),
-            workers=settings.solve_workers,
-            mode=SolveMode.REPRODUCIBLE,
-        )
-        hh, mm = req.now.split(":")
-        result = replan(
-            scenario,
-            base,
-            now_min=int(hh) * 60 + int(mm),
-            orders=orders,
-            spot_standby=req.spot_standby,
-            time_limit_s=settings.solve_time_limit_s,
-        )
-    except ValueError as exc:
-        ledger.release(req.subject, amount)
-        raise HTTPException(status_code=400, detail=str(exc)) from exc
-    except Exception as exc:
-        ledger.release(req.subject, amount)
-        logger.exception("組み直しに失敗")
-        raise HTTPException(status_code=500, detail="組み直せませんでした") from exc
-
-    ledger.record(
-        req.subject,
-        "solve",
-        amount,
-        plan_id=plan_id,
-        detail=f"replan seed={req.seed} now={req.now} orders={len(orders)} status={result.sub_plan.status}",
+    scenario = generate(
+        seed=req.seed,
+        date=req.date,
+        season=req.season,
+        absent_drivers=tuple(req.absent_drivers),
+        declined_customers=tuple(req.declined_customers),
     )
+    base = solve(
+        scenario,
+        matrix=build_matrix(scenario.depot, scenario.customers),
+        workers=settings.solve_workers,
+        mode=SolveMode.REPRODUCIBLE,
+    )
+    hh, mm = now.split(":")
+    result = replan(
+        scenario,
+        base,
+        now_min=int(hh) * 60 + int(mm),
+        orders=orders,
+        spot_standby=spot_standby,
+        time_limit_s=settings.solve_time_limit_s,
+        dry_run=dry_run,
+    )
+    if not dry_run and result.escapes:
+        escapes.record(scenario.date, result.escapes, plan_id=plan_id)
     return {
         "plan_id": plan_id,
+        "dry_run": result.dry_run,
         "ok": result.ok,
         "summary_ja": result.summary_ja(),
         "text_ja": format_replan_ja(result),
@@ -422,13 +404,153 @@ def make_replan(req: ReplanRequest) -> dict:
         "frozen_trip_count": len(result.frozen_trips),
         "vehicle_days": _vehicle_days_to_list(result.vehicle_days),
         "base_summary_ja": base.summary_ja(),
+        "escape_watch": escapes.summary(scenario.date),
         "diagnostics": {
             "base_reproducible": base.diagnostics.get("reproducible"),
             "replan_status": result.sub_plan.status,
             "replan_mode": result.sub_plan.diagnostics.get("solve_mode"),
         },
-        "elapsed_s": round(time.monotonic() - started, 3),
     }
+
+
+@app.post("/api/replan")
+def make_replan(req: ReplanRequest) -> dict:
+    """朝の計画に、当日の発注（発注システムかFAX）を差し込んで組み直す。"""
+    plan_id = uuid.uuid4().hex[:12]
+    started = time.monotonic()
+    try:
+        amount = ledger.reserve(req.subject, "solve")
+    except ledger.BudgetExceeded as exc:
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
+    try:
+        orders = [
+            NewOrder(o.customer_id, o.product, o.volume_l, o.source, o.evidence_ref)
+            for o in req.orders
+        ]
+        body = _replan_body(req, req.now, orders, req.spot_standby, dry_run=False, plan_id=plan_id)
+    except ValueError as exc:
+        ledger.release(req.subject, amount)
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        ledger.release(req.subject, amount)
+        logger.exception("組み直しに失敗")
+        raise HTTPException(status_code=500, detail="組み直せませんでした") from exc
+    ledger.record(req.subject, "solve", amount, plan_id=plan_id,
+                  detail=f"replan seed={req.seed} now={req.now} orders={len(orders)}")
+    body["elapsed_s"] = round(time.monotonic() - started, 3)
+    return body
+
+
+# ---------------------------------------------------------------------------
+# 当日発注の受け口（Gemini は読み取りと分類だけ）
+# ---------------------------------------------------------------------------
+
+
+class FaxIntakeRequest(PlanRequest):
+    """FAX の発注書を受けて、読めたらそのまま組み直す。"""
+
+    now: str = Field(pattern="^([01][0-9]|2[0-3]):[0-5][0-9]$")
+    image_base64: str = Field(min_length=16, description="FAX 画像（base64）")
+    mime: str = Field(default="image/png", pattern="^(image/(png|jpeg)|application/pdf)$")
+    spot_standby: int = Field(default=0, ge=0, le=10)
+
+
+class NoteIntakeRequest(PlanRequest):
+    """配車係のメモ（「宇品港から電話でレギュラー8kL」等）を受ける。"""
+
+    now: str = Field(pattern="^([01][0-9]|2[0-3]):[0-5][0-9]$")
+    note: str = Field(min_length=2, max_length=500)
+    spot_standby: int = Field(default=0, ge=0, le=10)
+
+
+def _intake_response(req: PlanRequest, got: "intake.Intake", now: str, spot_standby: int,
+                     plan_id: str) -> dict:
+    """読み取った結果から、組み直す・試算する・確認を求める、を決める。
+
+    **確認が要るものが1つでもあれば組み直さない。** 名前が絞れない、量が
+    読めない等を推測で埋めて車を動かすより、配車係に確かめてもらうほうが安い。
+    """
+    base = {
+        "plan_id": plan_id,
+        "read": got.raw,
+        "issues": got.issues,
+        "notice": got.notice,
+        "orders": [
+            {"customer_id": o.customer_id, "product": o.product.value, "volume_l": o.volume_l,
+             "source": o.source, "evidence_ref": o.evidence_ref}
+            for o in got.orders
+        ],
+        "model_usd": round(got.usd, 6),
+    }
+    if not got.ready:
+        base["action"] = "confirm"
+        base["summary_ja"] = "確認が要ります: " + " / ".join(got.issues or ["発注が読み取れませんでした"])
+        return base
+    replanned = _replan_body(req, now, got.orders, spot_standby, dry_run=got.notice, plan_id=plan_id)
+    base["action"] = "dry_run" if got.notice else "replanned"
+    base["replan"] = replanned
+    base["summary_ja"] = replanned["summary_ja"]
+    return base
+
+
+@app.post("/api/intake/fax")
+def intake_fax(req: FaxIntakeRequest) -> dict:
+    """FAX の発注書を読み、読めたらそのまま組み直す（証拠＝画像のハッシュ）。"""
+    plan_id = uuid.uuid4().hex[:12]
+    try:
+        amount = ledger.reserve(req.subject, "intake")
+    except ledger.BudgetExceeded as exc:
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
+    try:
+        image = base64.b64decode(req.image_base64, validate=True)
+        scenario = generate(seed=req.seed, date=req.date, season=req.season)
+        meter = CostMeter(request_id=plan_id, ceiling_usd=ledger.MAX_USD_PER_REQUEST)
+        got = intake.read_fax(image, req.mime, scenario.customers, caller=intake.gemini_caller, meter=meter)
+        body = _intake_response(req, got, req.now, req.spot_standby, plan_id)
+    except ValueError as exc:
+        ledger.release(req.subject, amount)
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        ledger.release(req.subject, amount)
+        logger.exception("FAXの受け付けに失敗")
+        raise HTTPException(status_code=502, detail=f"FAXを読めませんでした: {type(exc).__name__}") from exc
+    ledger.record(req.subject, "intake", amount, plan_id=plan_id,
+                  detail=f"fax action={body['action']} orders={len(body['orders'])}")
+    return body
+
+
+@app.post("/api/intake/note")
+def intake_note(req: NoteIntakeRequest) -> dict:
+    """配車係のメモを読む。電話の連絡は予告として試算だけ返し、確定させない。"""
+    plan_id = uuid.uuid4().hex[:12]
+    try:
+        amount = ledger.reserve(req.subject, "intake")
+    except ledger.BudgetExceeded as exc:
+        raise HTTPException(status_code=429, detail=str(exc)) from exc
+    try:
+        scenario = generate(seed=req.seed, date=req.date, season=req.season)
+        meter = CostMeter(request_id=plan_id, ceiling_usd=ledger.MAX_USD_PER_REQUEST)
+        got = intake.read_note(req.note, scenario.customers, caller=intake.gemini_caller, meter=meter)
+        body = _intake_response(req, got, req.now, req.spot_standby, plan_id)
+    except ValueError as exc:
+        ledger.release(req.subject, amount)
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        ledger.release(req.subject, amount)
+        logger.exception("メモの受け付けに失敗")
+        raise HTTPException(status_code=502, detail=f"メモを読めませんでした: {type(exc).__name__}") from exc
+    ledger.record(req.subject, "intake", amount, plan_id=plan_id,
+                  detail=f"note action={body['action']} orders={len(body['orders'])}")
+    return body
+
+
+@app.get("/api/escapes")
+def escape_watch(as_of: str = "2026-10-15") -> dict:
+    """直近30日の逃げ道と、恒常化の恐れ。"""
+    try:
+        return escapes.summary(as_of)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
 
 
 @app.get("/api/scenario")

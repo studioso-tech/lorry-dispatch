@@ -63,6 +63,10 @@ MIN_DROP_L = 2_000
 #: 発注として受け付ける経路。**証拠の残るものだけ。**（実務）
 ORDER_SOURCES = ("system", "fax")
 
+#: 予告（電話などの連絡）。**発注ではない。** 試算（dry_run）の中でだけ使える。
+#: 「入る余地があるか」を先に見ておき、発注書が届いたら発注として入れ直す。
+NOTICE_SOURCE = "notice"
+
 PRODUCT_JA = {
     Product.KEROSENE: "灯油",
     Product.GASOIL: "軽油",
@@ -91,13 +95,18 @@ class NewOrder:
     evidence_ref: str
 
     def __post_init__(self) -> None:
-        if self.source not in ORDER_SOURCES:
+        if self.source not in ORDER_SOURCES + (NOTICE_SOURCE,):
             raise ValueError(
                 f"発注は証拠の残る形でしか受けない（{'/'.join(ORDER_SOURCES)}）。"
-                f"{self.source!r} は不可。電話の連絡は予告として扱う"
+                f"{self.source!r} は不可。電話の連絡は予告（{NOTICE_SOURCE}）として扱う"
             )
         if not self.evidence_ref:
             raise ValueError("発注には証拠の所在（伝票番号・FAX画像）が要る")
+
+    @property
+    def is_notice(self) -> bool:
+        """予告か（発注ではない）。"""
+        return self.source == NOTICE_SOURCE
 
 
 @dataclass(frozen=True)
@@ -125,6 +134,8 @@ class ReplanResult:
     orders: tuple[NewOrder, ...] = ()
     #: 発注量どおりに入らなかった発注と、その理由。**配車係がSSに確認する材料。**
     shortfalls: tuple[str, ...] = ()
+    #: 試算か。**試算の結果で車を動かしてはいけない**し、逃げ道も記録しない。
+    dry_run: bool = False
 
     @property
     def ok(self) -> bool:
@@ -135,7 +146,10 @@ class ReplanResult:
         now = minutes_to_hhmm(self.now_min)
         if not self.sub_plan.is_usable:
             return f"{now} 時点で組み直せませんでした。"
-        parts = [f"{now} 時点で組み直しました。"]
+        if self.dry_run:
+            parts = [f"【試算・未確定】{now} 時点で入れるとしたら。発注書（発注システムかFAX）が届くまで車は動かしません。"]
+        else:
+            parts = [f"{now} 時点で組み直しました。"]
         if self.spot_called:
             parts.append(f"非専属を{len(self.spot_called)}台呼びます。")
         if self.escapes:
@@ -170,6 +184,7 @@ def replan(
     spot_standby: int = 0,
     time_limit_s: float = 20.0,
     mode: SolveMode = SolveMode.FAST,
+    dry_run: bool = False,
 ) -> ReplanResult:
     """朝の計画 base に、当日の発注 orders を差し込む。
 
@@ -181,12 +196,20 @@ def replan(
         spot_standby: いま呼べる待機の非専属の台数。
         time_limit_s: 求解の打ち切り（FAST のとき）。
         mode: 既定は FAST。組み直しは「いま組み直してほしい」要求なので時間で切る。
+        dry_run: 試算か。予告（電話の連絡など）を入れられるのは試算だけ。
 
     Raises:
         ValueError: 名簿に無い需要家、タンクの無い油種、量が0以下の発注。
             黙って捨てると「発注を入れた計画」として読まれるので落とす。
     """
     _validate(scenario, orders)
+    notices = [o for o in orders if o.is_notice]
+    if notices and not dry_run:
+        # **予告で車を動かさない。** 発注は証拠の残る形でしか受けない（実務）。
+        raise ValueError(
+            f"予告（{', '.join(o.customer_id for o in notices)}）は発注ではない。"
+            "試算（dry_run）でしか入れられない。発注書が届いてから入れ直す"
+        )
 
     # --- 1. 動かさない便 --------------------------------------------------
     frozen_by_vehicle: dict[str, list[Trip]] = {}
@@ -383,10 +406,8 @@ def replan(
             f"{take / 1000:.1f}kL" if take == o.volume_l
             else f"{take / 1000:.1f}kL（発注 {o.volume_l / 1000:.1f}kL）"
         )
-        label = (
-            f"{c.name} {PRODUCT_JA[o.product]} {amount}"
-            f"（当日発注・{'発注システム' if o.source == 'system' else 'FAX'} {o.evidence_ref}）"
-        )
+        via = {"system": "発注システム", "fax": "FAX", NOTICE_SOURCE: "予告・未確定"}[o.source]
+        label = f"{c.name} {PRODUCT_JA[o.product]} {amount}（当日発注・{via} {o.evidence_ref}）"
         if o.customer_id in new_assign:
             vid, trip, arrive = new_assign[o.customer_id]
             changes.append(f"{label}: {names[vid]}の{trip + 1}便目で {minutes_to_hhmm(arrive)} 着")
@@ -416,6 +437,7 @@ def replan(
         spot_called=spot_called,
         orders=tuple(orders),
         shortfalls=tuple(shortfalls),
+        dry_run=dry_run,
     )
 
 
