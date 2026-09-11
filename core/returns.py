@@ -12,30 +12,39 @@
 
 **費用は元売の管理責任**で、運送会社やSSには請求しない（空の荷を運んだのと同じ）。
 
+**持ち戻り品の処分が最優先**（実務）
+----------------------------------
+
+降ろすのが先で、**次の配送の時刻がずれるのは受け入れる**。積んだままでは後の配送が
+ずっとその持ち戻りの制約を受けるからで、先に身軽にするほうが一日として早く収まる。
+**必要なら、次の配送先分は他のローリーが持つ。**
+
+このため:
+
+    - 寄り道は**降ろせなかった先のすぐ後**に置く。便の帰り道まで積んだまま走る案は
+      取らない（以前はこちらを寄り道が短いという理由で選んでいた。優先順が逆だった）
+    - 後の先が受入時間に間に合わないことは、**その手を捨てる理由にしない**。
+      「他のローリーで持つ先」として結果に並べる
+    - **拘束・運転の上限だけは崩さない**（法令）。超えるときは後の便から順に
+      他のローリーへ渡して収める。渡しても収まらない手だけを、成り立たないとする
+
 候補を探すときに見るもの:
 
     - その油種のタンクに**丸ごと入る空き**があるか。今日すでに降ろした先や、
       このあと降ろす予定の先は、そのぶん空きを減らして数える
-    - 着く時刻に受け入れているか（営業時間・受入枠）
-    - 寄り道で後ろにずれる予定が、それぞれの受入枠に間に合うか
-    - 寄り道で延びる拘束・運転が、1日の上限に収まるか
-
-寄り道の位置は2通り試して短いほうを取る:
-
-    - 降ろせなかった先の**すぐ後**に寄る（近くに受け入れ先があるとき）
-    - 便の**帰り道**（最後の先から油槽所へ戻る途中）に寄る。クッションの大型SSは
-      インターの近く＝油槽所の近くにあるので、ふつうはこちら。最初はすぐ後しか
-      見ておらず、広島市内から大竹へ行って温品へ戻る +137分 の大回りを出していた
+    - 着く時刻に受け入れているか（早く着いたぶんは待つ。閉まった後は届かない）
 
 **近似**:
 
     - 分けて降ろす（2軒に半分ずつ）は見ない
-    - 寄り道のあとの予定は、寄り道の時間だけそのままずれるとする
+    - 引き継ぎの単位は「後の便まるごと」または「この便の後ろの先」。渡した先を
+      他のどのローリーが持てるかまでは、ここでは決めない（当日の組み直しの仕事）
+    - 休憩は入れ直さない。拘束は朝の計画の始まりから帰庫までで数える
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 
 from core.domain import (
     Customer,
@@ -55,6 +64,9 @@ PRODUCT_JA = {
     Product.REGULAR: "レギュラー",
     Product.PREMIUM: "ハイオク",
 }
+
+#: 乗務員から車庫へ連絡し、降ろし先を決めて動き出すまで（仮置）。
+CONFIRM_MIN = 10
 
 RESPONSIBILITY_JA = (
     "費用は元売の管理責任（計画配送の先の在庫は元売が管理する）。"
@@ -100,10 +112,23 @@ class ReturnOption:
     rank: int                 # 1=近くの降ろし先 2=クッション 3=積場へ持ち戻り（買い戻し）
     kind: str                 # "redeliver" / "cushion" / "buyback"
     destination: str
-    extra_min: int            # 寄り道で延びる時間
+    extra_min: int            # この手を取ると1日の終わりが延びる時間（引き継げば縮むこともある）
     arrive_min: int | None
     feasible: bool
     reason: str               # 成り立つ／成り立たない理由
+    handoff: tuple[str, ...] = ()   # 他のローリーで持つ先
+    delay_min: int = 0              # 後の予定がずれる時間
+
+
+@dataclass(frozen=True)
+class _Sim:
+    """寄り道を入れて、その便の残りと後の便をなぞった結果。"""
+
+    arrive_min: int           # 降ろし先に着く時刻
+    day_end_min: int          # 帰庫
+    day_drive_min: int        # 1日の運転時間
+    delay_min: int            # 後の予定がずれる時間
+    handoff: tuple[str, ...]  # 他のローリーで持つ先
 
 
 @dataclass
@@ -115,8 +140,9 @@ class ReturnPlan:
 
     @property
     def chosen(self) -> ReturnOption:
-        """推奨: 成り立つもののうち、近くの降ろし先 → クッション → 買い戻し の順。"""
-        return min((o for o in self.options if o.feasible), key=lambda o: (o.rank, o.extra_min))
+        """推奨: 近くの降ろし先 → クッション → 買い戻し。同じ順位なら引き継ぎの少ないほう。"""
+        return min((o for o in self.options if o.feasible),
+                   key=lambda o: (o.rank, len(o.handoff), o.extra_min))
 
     def summary_ja(self) -> str:
         e, c = self.event, self.chosen
@@ -127,16 +153,21 @@ class ReturnPlan:
         if c.kind == "buyback":
             return head + "近くにもクッションにも降ろせないため、積場へ持ち戻り、買い戻しとします。"
         where = "近くの" if c.kind == "redeliver" else "クッションの"
+        tail = ""
+        if c.delay_min:
+            tail += f"この後の予定は{c.delay_min}分ずれます。"
+        if c.handoff:
+            tail += f"{'、'.join(c.handoff)}は他のローリーで持ってください。"
         return (
-            head + f"{where}{c.destination}に {minutes_to_hhmm(c.arrive_min)} に降ろします"
-            f"（寄り道 +{c.extra_min}分）。"
+            head + f"先に降ろすことを優先し、{where}{c.destination}へ回します"
+            f"（{minutes_to_hhmm(c.arrive_min)}着、寄り道 +{c.extra_min}分）。" + tail
         )
 
 
 def format_return_ja(r: ReturnPlan) -> str:
     lines = [f"【持ち戻り】{r.summary_ja()}", f"   {RESPONSIBILITY_JA}", "", "■ 検討した手（上から優先）"]
     labels = {1: "近くの降ろし先", 2: "クッション", 3: "積場へ持ち戻り"}
-    for o in sorted(r.options, key=lambda o: (o.rank, not o.feasible, o.extra_min)):
+    for o in sorted(r.options, key=lambda o: (o.rank, not o.feasible, len(o.handoff), o.extra_min)):
         mark = "◎" if o is r.chosen else ("○" if o.feasible else "×")
         at = f" {minutes_to_hhmm(o.arrive_min)}着" if o.arrive_min is not None and o.extra_min else ""
         extra = f" +{o.extra_min}分" if o.kind != "buyback" and o.extra_min else ""
@@ -175,12 +206,11 @@ def handle_return(scenario: Scenario, plan: Plan, event: ReturnEvent) -> ReturnP
     later = list(trip.stops[idx + 1:])
     later_trips = [t for t in vd.trips if t.trip_index > trip.trip_index]
     depot = scenario.depot
-    nxt = by_id[later[0].customer_id] if later else None
 
-    def pos(c: Customer | None) -> tuple[float, float]:
-        return (c.lat, c.lon) if c is not None else (depot.lat, depot.lon)
-
-    base_leg = leg_minutes(*pos(failed), *pos(nxt))
+    # 後ろから順に他のローリーへ渡す単位。後の便まるごとが先、次にこの便の後ろの先。
+    units: list[tuple[str, object]] = (
+        [("trip", t) for t in reversed(later_trips)] + [("stop", s) for s in reversed(later)]
+    )
 
     # 今日の計画で各先に降ろす量（油種ごと）。空きの計算に使う。
     delivered: dict[str, dict[Product, int]] = {}
@@ -190,10 +220,65 @@ def handle_return(scenario: Scenario, plan: Plan, event: ReturnEvent) -> ReturnP
                 if s.customer_id != event.customer_id:
                     delivered[s.customer_id] = by_id[s.customer_id].demand_by_product()
 
+    def tail_drive_as_planned() -> int:
+        """朝の計画での、この便の尻尾（降ろせなかった先 → 後の先 → 油槽所）の運転時間。"""
+        lat, lon = failed.lat, failed.lon
+        total = 0
+        for s in later:
+            c = by_id[s.customer_id]
+            total += leg_minutes(lat, lon, c.lat, c.lon)
+            lat, lon = c.lat, c.lon
+        return total + leg_minutes(lat, lon, depot.lat, depot.lon)
+
+    planned_tail = tail_drive_as_planned()
+
+    def simulate(c: Customer, service: int, forced: int) -> _Sim | None:
+        """寄り道を降ろせなかった先のすぐ後に入れて、その日の残りをなぞる。
+
+        `forced` は、拘束を収めるために後ろから外す単位の数。受入時間に間に合わない
+        先は、外さなくても引き継ぎになる。着けない（閉まった後）ときは None。
+        """
+        dropped = {id(u[1]) for u in units[:forced]}
+        handoff: list[str] = []
+
+        arrive = here.depart_min + CONFIRM_MIN + leg_minutes(failed.lat, failed.lon, c.lat, c.lon)
+        if arrive > c.window_close_min:
+            return None
+        t = max(arrive, c.window_open_min) + service
+        lat, lon = c.lat, c.lon
+        drive = leg_minutes(failed.lat, failed.lon, c.lat, c.lon)
+
+        for s in later:
+            if id(s) in dropped:
+                handoff.append(s.customer_name)
+                continue
+            cust = by_id[s.customer_id]
+            d = leg_minutes(lat, lon, cust.lat, cust.lon)
+            if t + d > s.window_close_min:
+                handoff.append(s.customer_name)      # 間に合わない。他のローリーで持つ
+                continue
+            drive += d
+            t = max(t + d, s.window_open_min) + (s.depart_min - s.arrive_min)
+            lat, lon = cust.lat, cust.lon
+        drive += leg_minutes(lat, lon, depot.lat, depot.lon)
+        day_end = t + leg_minutes(lat, lon, depot.lat, depot.lon)
+
+        delay = day_end - trip.return_min
+        day_drive = vd.drive_min - planned_tail + drive
+        for t2 in later_trips:
+            missed = [s for s in t2.stops if s.arrive_min + delay > s.window_close_min]
+            if id(t2) in dropped or len(missed) == len(t2.stops):
+                handoff.extend(s.customer_name for s in t2.stops)
+                day_drive -= t2.drive_min
+                continue
+            handoff.extend(s.customer_name for s in missed)
+            day_end = t2.return_min + delay
+        return _Sim(arrive, day_end, day_drive, delay, tuple(handoff))
+
     def evaluate(c: Customer, rank: int, kind: str) -> ReturnOption:
-        room = _room(c, event.product, delivered.get(c.id, {}))
         if not any(t.product is event.product for t in c.tanks):
             return ReturnOption(rank, kind, c.name, 0, None, False, f"{PRODUCT_JA[event.product]}のタンクが無い")
+        room = _room(c, event.product, delivered.get(c.id, {}))
         if room < event.volume_l:
             return ReturnOption(rank, kind, c.name, 0, None, False,
                                 f"空きが {room / 1000:.1f}kL しかない（今日の予定を含む）")
@@ -201,51 +286,29 @@ def handle_return(scenario: Scenario, plan: Plan, event: ReturnEvent) -> ReturnP
             return ReturnOption(rank, kind, c.name, 0, None, False, "今日は受け入れていない")
         service = unload_minutes({event.product: event.volume_l}, c.bore_inch)
 
-        # (a) すぐ後に寄る
-        go_a = leg_minutes(*pos(failed), c.lat, c.lon)
-        arrive_a = here.arrive_min + 10 + go_a          # 確認と連絡に10分（仮置）
-        back_a = leg_minutes(c.lat, c.lon, *pos(nxt))
-        extra_a = 10 + go_a + service + back_a - base_leg
-        drive_a = go_a + back_a - base_leg
-        # (b) 帰り道に寄る（最後の先 → c → 油槽所）
-        last = by_id[trip.stops[-1].customer_id]
-        last_depart = trip.stops[-1].depart_min
-        go_b = leg_minutes(last.lat, last.lon, c.lat, c.lon)
-        arrive_b = last_depart + go_b
-        back_b = leg_minutes(c.lat, c.lon, depot.lat, depot.lon)
-        base_b = leg_minutes(last.lat, last.lon, depot.lat, depot.lon)
-        extra_b = go_b + service + back_b - base_b
-        drive_b = go_b + back_b - base_b
-
-        def in_window(t: int) -> bool:
-            return c.window_open_min <= t <= c.window_close_min
-
-        tries = []
-        if in_window(arrive_a):
-            tries.append((extra_a, arrive_a, drive_a, True))     # すぐ後: 後ろの先もずれる
-        if in_window(arrive_b):
-            tries.append((extra_b, arrive_b, drive_b, False))    # 帰り道: 同じ便の先はずれない
-        if not tries:
-            return ReturnOption(rank, kind, c.name, 0, arrive_a, False,
-                                f"{minutes_to_hhmm(arrive_a)} は受入時間外"
-                                f"（{minutes_to_hhmm(c.window_open_min)}〜{minutes_to_hhmm(c.window_close_min)}）")
-        extra, arrive, extra_drive, shifts_this_trip = min(tries)
-        late = [
-            s.customer_name for s in later
-            if shifts_this_trip and s.arrive_min + extra > s.window_close_min
-        ] + [
-            s.customer_name for t in later_trips for s in t.stops if s.arrive_min + extra > s.window_close_min
-        ]
-        if late:
-            return ReturnOption(rank, kind, c.name, extra, arrive, False,
-                                f"後の予定が受入時間に間に合わない（{'、'.join(late)}）")
-        if vd.duty_min + extra > driver.max_duty_min:
-            return ReturnOption(rank, kind, c.name, extra, arrive, False,
-                                f"拘束が {(vd.duty_min + extra) // 60}時間{(vd.duty_min + extra) % 60}分 になり上限を超える")
-        if vd.drive_min + extra_drive > driver.max_drive_min:
-            return ReturnOption(rank, kind, c.name, extra, arrive, False, "運転時間が上限を超える")
-        return ReturnOption(rank, kind, c.name, extra, arrive, True,
-                            f"空き {room / 1000:.1f}kL、後の予定に影響なし")
+        first: _Sim | None = None
+        for forced in range(len(units) + 1):
+            sim = simulate(c, service, forced)
+            if sim is None:
+                return ReturnOption(
+                    rank, kind, c.name, 0, None, False,
+                    f"着く頃には閉まっている（受入 〜{minutes_to_hhmm(c.window_close_min)}）")
+            first = first or sim
+            if (sim.day_end_min - vd.duty_start_min <= driver.max_duty_min
+                    and sim.day_drive_min <= driver.max_drive_min):
+                extra = sim.day_end_min - vd.duty_end_min
+                if sim.handoff:
+                    why = (f"空き {room / 1000:.1f}kL。先に降ろすことを優先し、"
+                           f"{len(sim.handoff)}軒は他のローリーで持つ")
+                elif sim.delay_min:
+                    why = f"空き {room / 1000:.1f}kL。後の予定が{sim.delay_min}分ずれる"
+                else:
+                    why = f"空き {room / 1000:.1f}kL、後の予定に影響なし"
+                return ReturnOption(rank, kind, c.name, extra, sim.arrive_min, True, why,
+                                    sim.handoff, sim.delay_min)
+        over = first.day_end_min - vd.duty_start_min if first else 0
+        return ReturnOption(rank, kind, c.name, 0, first.arrive_min if first else None, False,
+                            f"後を全部渡しても拘束が {over // 60}時間{over % 60}分 になり上限を超える")
 
     options: list[ReturnOption] = []
     for c in scenario.customers:

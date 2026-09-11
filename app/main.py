@@ -579,10 +579,12 @@ def make_return(req: ReturnRequest) -> dict:
         "text_ja": format_return_ja(r),
         "responsibility_ja": RESPONSIBILITY_JA,
         "chosen": {"kind": c.kind, "destination": c.destination, "extra_min": c.extra_min,
-                   "arrive": minutes_to_hhmm(c.arrive_min) if c.arrive_min is not None else None},
+                   "arrive": minutes_to_hhmm(c.arrive_min) if c.arrive_min is not None else None,
+                   "delay_min": c.delay_min, "handoff": list(c.handoff)},
         "options": [
             {"rank": o.rank, "kind": o.kind, "destination": o.destination, "extra_min": o.extra_min,
-             "feasible": o.feasible, "reason": o.reason}
+             "feasible": o.feasible, "reason": o.reason, "delay_min": o.delay_min,
+             "handoff": list(o.handoff)}
             for o in r.options
         ],
     }

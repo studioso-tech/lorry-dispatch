@@ -2,6 +2,9 @@
 
 優先順は実務どおり: 近くの降ろし先 → クッションの大型SS（大竹・岩国IC近く）
 → 積場へ持ち戻り（買い戻し）。費用は元売の管理責任で、運送会社・SSへの請求は無い。
+
+**持ち戻り品の処分が最優先**。積んだままでは後の配送がその制約を受けるので、
+次の配送の時刻がずれても先に降ろす。間に合わなくなった先は他のローリーで持つ。
 """
 
 from __future__ import annotations
@@ -32,6 +35,13 @@ def _day():
     raise AssertionError("計画配送の先が今日の計画に無い")
 
 
+def _vehicle_day(s, plan, e):
+    vd = next(v for v in plan.vehicle_days if v.vehicle_id == e.vehicle_id)
+    trip = next(t for t in vd.trips if any(st.customer_id == e.customer_id for st in t.stops))
+    idx = next(i for i, st in enumerate(trip.stops) if st.customer_id == e.customer_id)
+    return vd, trip, idx
+
+
 def test_nearby_redelivery_comes_first_even_if_the_cushion_is_shorter():
     """近くで降ろせる先があれば、クッションより寄り道が長くてもそちらを選ぶ（実務の優先順）。"""
     s, plan, e = _day()
@@ -53,27 +63,58 @@ def test_cushion_when_no_nearby_customer_has_room():
     assert r.chosen.kind == "cushion"
 
 
-def test_buyback_when_nothing_fits_the_day():
-    """クッションにも寄れない（拘束の上限を超える）なら、積場へ持ち戻って買い戻し。"""
+def test_later_stop_that_misses_its_window_is_handed_off_not_a_reason_to_refuse():
+    """**降ろすのが先。** 後の先が受入時間に間に合わなくなっても手を捨てず、他のローリーへ渡す。
+
+    以前はここで「後の予定が間に合わない」としてその手を捨てていた。持ち戻りを積んだままでは
+    後の配送がずっとその制約を受けるので、先に降ろすほうを取る（実務）。
+    """
     s, plan, e = _day()
-    vd = next(v for v in plan.vehicle_days if v.vehicle_id == e.vehicle_id)
+    vd, trip, idx = _vehicle_day(s, plan, e)
+    if len(trip.stops) <= idx + 1:
+        pytest.skip("この便には降ろせなかった先より後の先が無い")
+    nxt = trip.stops[idx + 1]
+    # 1分でもずれたら間に合わない受入枠にする
+    tight = replace(nxt, window_close_min=nxt.arrive_min + 1)
+    stops = trip.stops[:idx + 1] + (tight,) + trip.stops[idx + 2:]
+    plan2 = replace(plan, vehicle_days=tuple(
+        replace(v, trips=tuple(replace(t, stops=stops) if t is trip else t for t in v.trips))
+        if v is vd else v
+        for v in plan.vehicle_days
+    ))
+    r = handle_return(s, plan2, e)
+    assert r.chosen.feasible
+    assert r.chosen.kind != "buyback"
+    assert nxt.customer_name in r.chosen.handoff
+    assert "他のローリー" in r.summary_ja()
+
+
+def test_buyback_when_even_going_straight_home_breaks_the_duty_limit():
+    """後を全部他のローリーへ渡しても拘束の上限を超えるなら、積場へ持ち戻って買い戻し。"""
+    s, plan, e = _day()
+    vd, trip, idx = _vehicle_day(s, plan, e)
+    here = trip.stops[idx]
     driver_id = next(v.driver_id for v in s.vehicles if v.id == e.vehicle_id)
-    tight = tuple(replace(d, max_duty_min=vd.duty_min) if d.id == driver_id else d for d in s.drivers)
+    # 降ろせなかった先を出た時点で上限。ここから1分も動けない
+    cap = here.depart_min - vd.duty_start_min
+    tight = tuple(replace(d, max_duty_min=cap) if d.id == driver_id else d for d in s.drivers)
     s2 = replace(s, drivers=tight)
     r = handle_return(s2, plan, e)
     assert r.chosen.kind == "buyback"
     assert "買い戻し" in r.summary_ja()
 
 
-def test_every_option_respects_room_windows_and_duty():
-    """成り立つとした手は、空き・受入時間・拘束の上限をすべて満たしている。"""
+def test_feasible_options_stay_within_the_duty_limit():
+    """成り立つとした手は、拘束の上限（法令）を守っている。後の予定のずれは理由にしない。"""
     s, plan, e = _day()
-    r = handle_return(s, plan, e)
-    vd = next(v for v in plan.vehicle_days if v.vehicle_id == e.vehicle_id)
+    vd, _trip, _idx = _vehicle_day(s, plan, e)
     cap = s.driver(next(v.driver_id for v in s.vehicles if v.id == e.vehicle_id)).max_duty_min
+    r = handle_return(s, plan, e)
     for o in r.options:
         if o.feasible and o.kind != "buyback":
             assert vd.duty_min + o.extra_min <= cap
+    # ずれを受け入れた手が実際に並んでいる（ずれが失格の理由になっていない）
+    assert any(o.feasible and o.delay_min > 0 for o in r.options)
 
 
 def test_responsibility_is_stated():
