@@ -662,3 +662,22 @@ def test_declined_customer_is_never_visited():
     assert target.id not in p.diagnostics["mandatory_basis"]
     assert [d["customer_id"] for d in p.diagnostics["declined"]] == [target.id]
     assert "受入見送り" in format_plan_ja(p)
+
+
+def test_day_shift_lorries_leave_at_five():
+    """日勤のローリーは5:00より前に車庫を出ない（通勤の混雑を避けるため。実務）。
+
+    油槽所は4:00に開いているが、それで動けるのは24時間稼働（二交代）の車だけ。
+    """
+    from dataclasses import replace
+
+    from core.domain import DAY_SHIFT_DEPART_MIN
+
+    _s, _m, plan = _plan(20261015)
+    for vd in plan.vehicle_days:
+        assert vd.trips[0].load_start_min >= DAY_SHIFT_DEPART_MIN, vd.vehicle_id
+
+    s = generate(seed=20261015, season="winter")
+    s.vehicles = tuple(replace(v, round_the_clock=True) for v in s.vehicles)
+    p = solve(s, matrix=build_matrix(s.depot, s.customers), time_limit_s=TEST_TIME_LIMIT_S)
+    assert min(vd.trips[0].load_start_min for vd in p.vehicle_days) < DAY_SHIFT_DEPART_MIN

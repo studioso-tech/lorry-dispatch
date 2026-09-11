@@ -56,7 +56,9 @@ from core.travel import build_matrix  # noqa: E402
 #: エリアごとに台数を足していく順（単車を先に。scripts/size_fleet.py と同じ理由）。
 ADD_ORDER: tuple[str, ...] = ("v4", "v5", "v1", "v2", "v3")
 
-CACHE = Path(__file__).resolve().parents[1] / "data" / "carrier_cache_v2.json"
+# モデルを変えたら版を上げる（キャッシュに古い答えが残らないように）。
+# v3: 積込 40分 → 20分（実務）、日勤は5:00に車庫を出る
+CACHE = Path(__file__).resolve().parents[1] / "data" / "carrier_cache_v3.json"
 
 #: 1人1日の拘束の上限（改善基準告示の原則13時間）。融通した場合の下限に使う。
 DUTY_CAP_MIN = 780

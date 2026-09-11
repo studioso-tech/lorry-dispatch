@@ -57,6 +57,7 @@ import ortools
 from ortools.sat.python import cp_model
 
 from core.domain import (
+    DAY_SHIFT_DEPART_MIN,
     LABOR_BREAK_45_MIN,
     LABOR_BREAK_60_MIN,
     LABOR_BREAK_DUTY_45_MIN,
@@ -619,7 +620,9 @@ def solve(
             return True                       # 帰庫はいつでもできる
         latest_j = cust(j).window_close_min
         if i < R:
-            earliest = depot.open_min + load_min + travel[0][mat(j)]
+            # 一番早く出られる車（24時間稼働なら開所、日勤なら5:00）から数える
+            first = min(start_of(veh) for veh in fleet) if fleet else depot.open_min
+            earliest = first + load_min + travel[0][mat(j)]
         else:
             earliest = (
                 cust(i).window_open_min + cust(i).service_min + travel[mat(i)][mat(j)]
@@ -637,10 +640,12 @@ def solve(
 
     # 車が最初の便の積込を始められる時刻。朝の計画では油槽所の開所。
     # 当日の組み直しでは、午前の便から戻る時刻（Vehicle.available_from_min）。
+    # 日勤の車は5:00より前には車庫を出ない（通勤の混雑を避けるため。実務）。
     def start_of(veh: Vehicle) -> int:
+        earliest = depot.open_min if veh.round_the_clock else max(depot.open_min, DAY_SHIFT_DEPART_MIN)
         if veh.available_from_min is None:
-            return depot.open_min
-        return max(depot.open_min, veh.available_from_min)
+            return earliest
+        return max(earliest, veh.available_from_min)
 
     # 時刻。油槽所の複製は「その便の出発時刻」、需要家は「到着時刻」。
     t = [

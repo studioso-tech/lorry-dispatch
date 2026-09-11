@@ -54,7 +54,8 @@ from core.travel import leg_minutes
 # ---------------------------------------------------------------------------
 
 #: 麻里布（岩国・和木）。ENEOS 麻里布製油所に併設の油槽所という設定。
-#: 04:00 開所は早朝便（運送会社営業所の 05:00 枠）に間に合わせるため。
+#: 04:00 開所。24時間稼働（二交代）の車はこの時刻から積める。日勤の車は
+#: 通勤の混雑を避けて 5:00 に車庫を出る（domain.DAY_SHIFT_DEPART_MIN）。
 MARIFU = Depot(
     id="depot_marifu",
     name="麻里布油槽所",
@@ -62,7 +63,8 @@ MARIFU = Depot(
     lon=132.2244,
     open_min=hhmm_to_minutes("04:00"),
     close_min=hhmm_to_minutes("22:00"),
-    load_min=40,
+    # 積込は平均20分（実務）。積場は8レーンで8台まで同時に積める。
+    load_min=20,
 )
 
 
