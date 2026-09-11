@@ -118,6 +118,18 @@ VEHICLE_FIXED_COST_MIN = 90
 #: 配車係が読む表としては嘘である。
 DUTY_COST_PER_MIN = 1
 
+#: 朝の計画から担当の車を変えたときの罰（分換算）。**仮置。**
+#:
+#: 乗務員はもう朝の計画を聞いて動いている。担当を入れ替えると連絡と積み荷の
+#: 組み替えの手間がかかり、現場は混乱する。「1軒の担当を変えるのは、1時間の
+#: 遠回りに相当する手間」とした。当日の組み直しでだけ効く。
+STABILITY_PENALTY_MIN = 60
+
+#: 非専属を1台呼ぶ費用（分換算）。**仮置。** 専属より2〜3割高い単価の1日ぶんの
+#: 割増（13時間×25% ≒ 195分）に呼び出しの手間を足した水準。専属の余りで
+#: 入るなら非専属は呼ばない、計画配送をずらすくらいなら非専属を呼ぶ、の順になる。
+SPOT_CALL_COST_MIN = 240
+
 #: 1台が1日に回れる便の上限。油槽所の節点をこの数だけ複製する。
 MAX_TRIPS_PER_VEHICLE = 2
 
@@ -493,6 +505,7 @@ def solve(
     tiebreak_phase: bool = True,
     log: bool = False,
     mode: SolveMode = SolveMode.FAST,
+    baseline: dict[str, str] | None = None,
 ) -> Plan:
     """1日ぶんの配車を解く。
 
@@ -508,6 +521,9 @@ def solve(
             だけを知りたい用途では、2段目は要らないぶん丸ごと省ける。
             配車係や審査員に見せる計画では True のままにすること。
         log: CP-SAT の探索ログを出すか。障害調査用。
+        baseline: 当日の組み直しで、朝の計画の担当（需要家ID → 車ID）。
+            担当を変えると STABILITY_PENALTY_MIN の罰がかかり、なるべく朝の
+            計画を崩さない。朝の計画を組むときは None。
         mode: 打ち切り方（SolveMode）。REPRODUCIBLE では time_limit_s と
             workers を**無視する**（探索量と並列数を固定するため）。
             既定が FAST なのは、内部の呼び出し（掃引・テスト）が時間の
@@ -619,12 +635,19 @@ def solve(
 
     x: list[dict[tuple[int, int], cp_model.IntVar]] = [{} for _ in range(V)]
 
+    # 車が最初の便の積込を始められる時刻。朝の計画では油槽所の開所。
+    # 当日の組み直しでは、午前の便から戻る時刻（Vehicle.available_from_min）。
+    def start_of(veh: Vehicle) -> int:
+        if veh.available_from_min is None:
+            return depot.open_min
+        return max(depot.open_min, veh.available_from_min)
+
     # 時刻。油槽所の複製は「その便の出発時刻」、需要家は「到着時刻」。
     t = [
         [
             model.NewIntVar(
-                depot.open_min + load_min if i < R else cust(i).window_open_min,
-                horizon if i < R else cust(i).window_close_min,
+                start_of(fleet[v]) + load_min if i < R else cust(i).window_open_min,
+                max(horizon, start_of(fleet[v]) + load_min) if i < R else cust(i).window_close_min,
                 f"t_v{v}_n{i}",
             )
             for i in range(N)
@@ -671,7 +694,7 @@ def solve(
             model.Add(t[v][r] <= t[v][r + 1])
         for r in range(1, R):
             model.Add(t[v][r] == horizon).OnlyEnforceIf(active[v][r].Not())
-        model.Add(t[v][0] == depot.open_min + load_min).OnlyEnforceIf(used[v].Not())
+        model.Add(t[v][0] == start_of(fleet[v]) + load_min).OnlyEnforceIf(used[v].Not())
         model.Add(duty_end[v] == t[v][0]).OnlyEnforceIf(used[v].Not())
 
     # --- 訪問の一意性 ------------------------------------------------------
@@ -703,6 +726,10 @@ def solve(
             sorted(a.compartments_l) == sorted(b.compartments_l)
             and (da.max_duty_min, da.max_drive_min) == (db.max_duty_min, db.max_drive_min)
             and da.available == db.available
+            # 途中から解くときは、空く時刻や今日の拘束が違えば別物
+            and (a.spot, a.available_from_min, a.duty_origin_min, a.driven_min)
+            == (b.spot, b.available_from_min, b.duty_origin_min, b.driven_min)
+            and a.vehicle_class == b.vehicle_class
         )
 
     symmetric_pairs = 0
@@ -767,7 +794,9 @@ def solve(
     for v, veh in enumerate(fleet):
         d = scenario.driver(veh.driver_id)
 
-        drive_v = model.NewIntVar(0, d.max_drive_min, f"drive_v{v}")
+        # 運転時間は1日通しで数える。組み直しでは午前にすでに運転したぶん
+        # （driven_min）を差し引いた残りしか使えない。
+        drive_v = model.NewIntVar(0, max(0, d.max_drive_min - veh.driven_min), f"drive_v{v}")
         model.Add(
             drive_v == sum(travel[mat(i)][mat(j)] * lit for (i, j), lit in x[v].items())
         )
@@ -806,8 +835,8 @@ def solve(
         overs = []
         for step in (1, 2, 3):
             o = model.NewBoolVar(f"over{step}_v{v}")
-            model.Add(drive_v > step * limit).OnlyEnforceIf(o)
-            model.Add(drive_v <= step * limit).OnlyEnforceIf(o.Not())
+            model.Add(drive_v + veh.driven_min > step * limit).OnlyEnforceIf(o)
+            model.Add(drive_v + veh.driven_min <= step * limit).OnlyEnforceIf(o.Not())
             if overs:
                 model.AddImplication(o, overs[-1])   # 3区切り超なら2区切りも超えている
             overs.append(o)
@@ -877,7 +906,13 @@ def solve(
             + (LABOR_BREAK_60_MIN - LABOR_BREAK_45_MIN) * w8
         )
 
-        model.Add(duty_v == duty_end[v] - (t[v][0] - load_min)).OnlyEnforceIf(used[v])
+        # 拘束は1日通しで数える。組み直しでは、午前の便で拘束が始まった時刻
+        # （duty_origin_min）から数える。午前にとった休憩の有無は追わず、1日ぶんの
+        # 休憩を拘束の中に見込む近似（安全側にも危険側にも大きくは振れない）。
+        if fleet[v].duty_origin_min is not None:
+            model.Add(duty_v == duty_end[v] - fleet[v].duty_origin_min).OnlyEnforceIf(used[v])
+        else:
+            model.Add(duty_v == duty_end[v] - (t[v][0] - load_min)).OnlyEnforceIf(used[v])
         model.Add(duty_v == 0).OnlyEnforceIf(used[v].Not())
         model.Add(duty_v <= d.max_duty_min)
 
@@ -895,6 +930,21 @@ def solve(
         if p:
             penalties.append(p * (1 - served[c_idx]))
 
+    # 朝の計画から担当を変えた罰（当日の組み直しでだけ効く）。
+    changes = []
+    if baseline:
+        vid_index = {veh.id: v for v, veh in enumerate(fleet)}
+        for c_idx, c in enumerate(customers):
+            b = baseline.get(c.id)
+            if b is None or b not in vid_index:
+                continue
+            node = R + c_idx
+            changes.extend(
+                STABILITY_PENALTY_MIN * active[v][node]
+                for v in range(V)
+                if v != vid_index[b]
+            )
+
     primary = model.NewIntVar(0, 10**9, "primary")
     model.Add(
         primary
@@ -902,6 +952,9 @@ def solve(
         + DUTY_COST_PER_MIN * sum(duty)
         + sum(penalties)
         + VEHICLE_FIXED_COST_MIN * sum(used)
+        # 非専属は呼ぶと割高（専属の余りで入るなら呼ばない）
+        + SPOT_CALL_COST_MIN * sum(used[v] for v, veh in enumerate(fleet) if veh.spot)
+        + sum(changes)
     )
 
     # --- タイブレーク（決定性のため） --------------------------------------
