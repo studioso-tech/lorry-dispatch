@@ -11,7 +11,8 @@
     - 需要家の受入時間枠（TW）
     - 乗務員の拘束時間・運転時間・連続運転の休憩（改善基準告示）
     - 労働基準法34条の休憩（430休憩とは別条。足さず、大きいほうを取る）
-    - 発注点割れの需要家は必須訪問、それ以外は任意（切迫度で重み付け）
+    - 必須訪問は「発注」「計画配送の先の発注点割れ」「欠品の直前」。
+      受入見送りの先には配車しない（需要家の意思）
     - 1台が1日に複数便を回る（油槽所へ戻って積み直す）
 
 まだ無いもの:
@@ -78,7 +79,7 @@ from core.travel import TravelMatrix, build_matrix
 # 「この需要家を回るために何分の遠回りまで許すか」で読める形にしてある。
 # ---------------------------------------------------------------------------
 
-#: 必須訪問（発注点割れ）を落としたときの罰。実質的な禁止。
+#: 必須訪問（発注・計画配送の発注点割れ・欠品の直前）を落としたときの罰。実質的な禁止。
 #: それでも有限にしてあるのは、**解無しで黙るより「3軒回れなかった」と
 #: 言えるほうが役に立つ**から。エージェントはこれを読んで代替案を出す。
 PENALTY_MANDATORY_MIN = 100_000
@@ -351,9 +352,18 @@ class Plan:
             f"{vehicles}台・{trips}便で{stops}軒。走行は合計"
             f"{self.total_drive_min // 60}時間{self.total_drive_min % 60}分。"
         )
+        declined = self.diagnostics.get("declined") or []
+        at_risk = sum(1 for d in declined if d.get("at_risk"))
+        tail = ""
+        if declined:
+            tail = f" 受入見送り{len(declined)}軒には配車していません"
+            tail += f"（うち{at_risk}軒は在庫が欠品に向かっています）。" if at_risk else "。"
+        # 「必ず回る先」＝発注・計画配送の発注点割れ・欠品の直前。
+        # 以前は「在庫が切れかけ」と書いていたが、発注で必須になった先は
+        # 在庫に余裕があることもあるので、言い方を合わせた。
         if missed:
-            return head + f" ただし在庫が切れかけの{missed}軒に本日は届けられません。"
-        return head + " 在庫が切れかけの需要家はすべて回れます。"
+            return head + f" ただし必ず回るべき{missed}軒に本日は届けられません。" + tail
+        return head + " 必ず回るべき先（発注・発注点割れ・欠品の直前）はすべて回れます。" + tail
 
 
 def _optional_penalty(customer: Customer) -> int:
@@ -511,6 +521,28 @@ def solve(
         "mandatory_demand_l": scenario.mandatory_demand_l,
         "total_demand_l": sum(c.demand_l for c in customers),
         "mandatory_count": sum(1 for c in customers if c.is_mandatory),
+        # 必須にした理由。order（需要家の発注）/ planned（計画配送の先の
+        # 発注点割れ＝運送会社側の約束）/ stockout（今日行かないと明日の
+        # 配送より先に空になる）。
+        "mandatory_basis": {
+            c.id: c.mandatory_basis for c in customers if c.is_mandatory
+        },
+        # 受入を見送っている需要家。**配車しない**（行っても降ろせない）。
+        # at_risk が真の先は在庫が欠品に向かっているので、計画では救えない
+        # ことを誰かに知らせる必要がある（エージェント層の仕事）。
+        "declined": [
+            {
+                "customer_id": c.id,
+                "customer_name": c.name,
+                "at_risk": c.declined_at_risk,
+                "days_to_empty": (
+                    None if math.isinf(c.min_days_to_empty())
+                    else round(c.min_days_to_empty(), 2)
+                ),
+            }
+            for c in customers
+            if not c.accepts_delivery
+        ],
         "usable_vehicles": [v.id for v in fleet],
         "absent_drivers": [d.id for d in scenario.drivers if not d.available],
         "max_trips_per_vehicle": R,
@@ -1194,9 +1226,19 @@ def format_plan_ja(plan: Plan) -> str:
                 )
         lines.append("")
 
+    declined = plan.diagnostics.get("declined") or []
+    if declined:
+        lines.append("■ 受入見送り（配車していません）")
+        for d in declined:
+            days = "∞" if d["days_to_empty"] is None else f"{d['days_to_empty']:.1f}日"
+            note = "　**在庫が欠品に向かっています。計画では救えません**" if d["at_risk"] else ""
+            lines.append(f"   {d['customer_name']}　在庫あと {days}{note}")
+        lines.append("")
+
     if plan.unserved:
         lines.append("■ 今日は回れない需要家")
         for u in sorted(plan.unserved, key=lambda u: u.days_to_empty):
+            # 【要手配】は必須（発注または欠品の直前）なのに回れなかった先。
             mark = "【要手配】" if u.mandatory else "　　　　"
             days = "∞" if math.isinf(u.days_to_empty) else f"{u.days_to_empty:.1f}日"
             lines.append(

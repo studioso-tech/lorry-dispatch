@@ -156,6 +156,10 @@ class PlanRequest(BaseModel):
     absent_drivers: list[str] = Field(
         default_factory=list, description="欠勤する乗務員ID（例 ['d1']）"
     )
+    declined_customers: list[str] = Field(
+        default_factory=list,
+        description="今日の受入を見送る需要家ID（例 ['c03']）。配車しない",
+    )
     subject: str = Field(default="demo", description="利用者の識別子。台帳の単位")
     mode: SolveMode = Field(
         default=SolveMode.REPRODUCIBLE,
@@ -268,6 +272,7 @@ def make_plan(req: PlanRequest) -> dict:
             date=req.date,
             season=req.season,
             absent_drivers=tuple(req.absent_drivers),
+            declined_customers=tuple(req.declined_customers),
         )
     except ValueError as exc:
         ledger.release(req.subject, amount)
@@ -356,6 +361,10 @@ def scenario_view(
                 "service_min": c.service_min,
                 "demand_l": c.demand_l,
                 "mandatory": c.is_mandatory,
+                "mandatory_basis": c.mandatory_basis,
+                "ordering": c.ordering,
+                "orders": [{"product": p.value, "l": q} for p, q in c.orders],
+                "accepts_delivery": c.accepts_delivery,
                 "days_to_empty": (
                     None
                     if c.min_days_to_empty() == float("inf")
@@ -369,6 +378,8 @@ def scenario_view(
                         "reorder_l": t.reorder_l,
                         "daily_use_l": t.daily_use_l,
                         "needs_topup": t.needs_topup,
+                        "below_reorder": t.is_below_reorder,
+                        "stockout_before_next_delivery": t.stockout_before_next_delivery,
                     }
                     for t in c.tanks
                 ],

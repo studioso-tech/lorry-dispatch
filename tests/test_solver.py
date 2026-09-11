@@ -20,7 +20,7 @@ from functools import lru_cache
 import pytest
 
 from core.generator import generate
-from core.solver import solve
+from core.solver import format_plan_ja, solve
 from core.travel import build_matrix
 
 #: 通常のテストで使う seed。ここを増やすと1回の実行が分単位で伸びる。
@@ -601,3 +601,31 @@ def test_reproducible_mode_holds_without_an_optimality_proof():
     assert _signature(a) == _signature(b)
     assert a.objective == b.objective
     assert a.diagnostics["tiebreak"] == b.diagnostics["tiebreak"]
+
+
+
+# ---------------------------------------------------------------------------
+# 受入見送り
+# ---------------------------------------------------------------------------
+
+
+def test_declined_customer_is_never_visited():
+    """受入を見送った需要家には、発注があっても配車しない。
+
+    **断られても配車してしまう問題**の回帰テスト。見送った先は「回れなかった
+    必須訪問」にも数えない（行けなかったのではなく、行かないのが正しい）。
+    代わりに診断と説明文で見送りを知らせる。
+    """
+    base = generate(seed=20261015, season="winter")
+    target = next(c for c in base.customers if c.mandatory_basis == "order")
+
+    s = generate(seed=20261015, season="winter", declined_customers=(target.id,))
+    s.vehicles = tuple(v for v in s.vehicles if v.id in {"v1", "v4", "v5"})
+    p = solve(s, matrix=build_matrix(s.depot, s.customers), time_limit_s=TEST_TIME_LIMIT_S)
+
+    visited = {st.customer_id for vd in p.vehicle_days for t in vd.trips for st in t.stops}
+    assert target.id not in visited
+    assert target.id not in {u.customer_id for u in p.mandatory_missed}
+    assert target.id not in p.diagnostics["mandatory_basis"]
+    assert [d["customer_id"] for d in p.diagnostics["declined"]] == [target.id]
+    assert "受入見送り" in format_plan_ja(p)

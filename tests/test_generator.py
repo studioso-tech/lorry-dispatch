@@ -81,6 +81,8 @@ def test_demand_covers_only_tanks_needing_topup():
     """
     s = generate(seed=3, season="winter")
     for c in s.customers:
+        if c.ordering:
+            continue   # 発注配送の先は発注量で決まる（別のテスト）
         expected = sum(t.topup_l for t in c.tanks if t.needs_topup)
         assert c.demand_l == expected
         for t in c.tanks:
@@ -90,11 +92,96 @@ def test_demand_covers_only_tanks_needing_topup():
             assert projected <= t.reorder_l
 
 
-def test_mandatory_means_already_below_reorder():
-    """必須訪問は「すでに発注点を割っている」こと。先読みぶんは必須ではない。"""
-    s = generate(seed=5, season="winter")
-    for c in s.customers:
-        assert c.is_mandatory == any(t.is_below_reorder for t in c.tanks)
+def test_mandatory_depends_on_whose_promise_it_is():
+    """必須訪問は「誰の約束か」で決まる。
+
+        受入見送り  → 必須にしない（需要家の意思）
+        発注配送    → 発注があれば必須（需要家の約束）
+        計画配送    → 発注点割れで必須（運送会社側の約束）
+        どの先でも  → 欠品の直前なら必須
+    """
+    for seed in range(1, 11):
+        for c in generate(seed=seed, season="winter").customers:
+            stockout = any(t.stockout_before_next_delivery and t.topup_l > 0 for t in c.tanks)
+            below = any(t.is_below_reorder and t.topup_l > 0 for t in c.tanks)
+            if c.ordering:
+                expected = bool(c.orders) or stockout
+            else:
+                expected = below or stockout
+            assert c.is_mandatory == (c.accepts_delivery and expected), c.id
+
+
+def test_ordering_customer_below_reorder_without_order_is_not_forced():
+    """発注配送の先で、発注の無い油種が発注点を割っていても押しかけない。
+
+    何を入れるかは需要家が決めている。値下げ前に在庫を下げている先がこれに
+    あたる。**ただし欠品の直前なら行く**（別のテスト）。
+    """
+    from dataclasses import replace
+
+    c = next(x for x in generate(seed=20261015).customers if x.ordering)
+    t = c.tanks[0]
+    low = replace(t, level_l=t.reorder_l - 1)            # 発注点は割っている
+    assert low.is_below_reorder and not low.stockout_before_next_delivery
+    c2 = replace(c, orders=(), tanks=(low,) + c.tanks[1:])
+    assert not c2.is_mandatory
+    assert c2.demand_l == 0
+
+
+def test_declined_customer_gets_nothing():
+    """受入見送りの先には何も降ろさない。発注があっても、欠品の直前でも。
+
+    **在庫は需要家の意思を代理できない。** 見送りなのに在庫が危ない先は
+    declined_at_risk で知らせる（計画では救えないので、配車はしない）。
+    """
+    base = {c.id: c for c in generate(seed=20261015, season="winter").customers}
+    target = next(c for c in base.values() if c.is_mandatory)
+    s = generate(seed=20261015, season="winter", declined_customers=(target.id,))
+    c = next(x for x in s.customers if x.id == target.id)
+    assert c.demand_l == 0
+    assert not c.is_mandatory
+    assert c.mandatory_basis is None
+    assert c.declined_at_risk == any(
+        t.is_below_reorder or t.stockout_before_next_delivery for t in c.tanks
+    )
+    # ほかの需要家は変わらない（見送りは1軒だけに効く）
+    for x in s.customers:
+        if x.id != target.id:
+            assert x.demand_l == base[x.id].demand_l
+
+
+def test_unknown_declined_customer_is_rejected():
+    """見送りの綴り違いは落とす。黙って通すと、見送りが効かないまま
+    「見送りを入れた計画」として読まれる。"""
+    with pytest.raises(ValueError, match="名簿に無い"):
+        generate(seed=1, declined_customers=("c99",))
+
+
+def test_order_is_capped_by_ullage():
+    """発注量が空き容量を超えていたら、入りきる分だけ降ろす。"""
+    from dataclasses import replace
+
+    c = next(x for x in generate(seed=20261015).customers if x.ordering)
+    t = c.tanks[0]
+    big = replace(c, orders=((t.product, t.capacity_l * 10),))
+    assert big.demand_by_product()[t.product] == t.topup_l
+
+
+def test_stockout_forces_a_visit_even_without_an_order():
+    """発注配送の先でも、欠品の直前なら必須にする。**欠品は最上位。**
+
+    何を頼むかは需要家が決めるが、頼み忘れで明日より先に空になるなら
+    行く。これは元売の信用の問題なので、発注の有無より優先する。
+    """
+    from dataclasses import replace
+
+    c = next(x for x in generate(seed=20261015).customers if x.ordering)
+    t = c.tanks[0]
+    dry = replace(t, level_l=t.daily_use_l // 2)          # 半日で空になる
+    c2 = replace(c, orders=(), tanks=(dry,) + c.tanks[1:])
+    assert dry.stockout_before_next_delivery
+    assert c2.is_mandatory and c2.mandatory_basis == "stockout"
+    assert c2.demand_by_product()[t.product] == dry.topup_l
 
 
 def test_absent_driver_removes_vehicle():

@@ -36,6 +36,14 @@ from enum import Enum
 #: この定数を触らなくても対象タンクが自然に増える。
 DELIVERY_LOOKAHEAD_DAYS = 2.0
 
+#: 「今日行かなければ欠品する」の判定に使う日数。
+#:
+#: 二次配送は「明日また来られる」を前提に組む。したがって**今日行かないと
+#: 明日の配送より先に空になる**タンクが、本当の欠品にあたる。発注点
+#: （reorder_l）はそれより手前に置いた計画上の目安で、割っただけでは
+#: まだ空にならない。
+STOCKOUT_HORIZON_DAYS = 1.0
+
 
 #: 労働基準法34条の休憩。**基準は拘束時間ではなく労働時間**（＝拘束−休憩）。
 #:
@@ -283,6 +291,15 @@ class Tank:
         projected = self.level_l - self.daily_use_l * DELIVERY_LOOKAHEAD_DAYS
         return projected <= self.reorder_l
 
+    @property
+    def stockout_before_next_delivery(self) -> bool:
+        """今日行かなければ、明日の配送より先に空になるか。**これが本当の欠品。**
+
+        発注点割れ（is_below_reorder）とは別物。発注点は「そろそろ手配する」
+        目安であって、割っても今日明日で空になるとは限らない。
+        """
+        return self.days_to_empty() < STOCKOUT_HORIZON_DAYS
+
     def days_to_empty(self) -> float:
         """このまま補給しなければ何日で空になるか。
 
@@ -325,6 +342,22 @@ class Customer:
     #: 配管が4インチでも3インチになる先がほとんど。
     bore_inch: int = 3
 
+    #: 需要家が自分で発注する先か（発注配送）。False なら、元売・運送会社が
+    #: 需要見込みで運ぶ先（計画配送）。**どちらも前日に決まり、合わさって
+    #: 翌日の配送計画になる。**
+    ordering: bool = False
+
+    #: 前日までに受けた発注（油種, L）。**需要家の約束**なので必須訪問になる。
+    orders: tuple[tuple["Product", int], ...] = ()
+
+    #: 今日の受入を受けるか。**需要家の意思。**
+    #:
+    #: 値下げ前には在庫を下げたがって受入を見送る（安い油が来る前に高い
+    #: 在庫を抱えたくない）。**発注点を割っていても「要らない」と言われる。**
+    #: 在庫は需要家の意思を代理できないので、見送りの先には配車しない。
+    #: 見送りは乗務員の欠勤と同じく、外から与える事象として扱う。
+    accepts_delivery: bool = True
+
     def __post_init__(self) -> None:
         if self.bore_inch not in UNLOAD_FLOW:
             raise ValueError(
@@ -343,27 +376,85 @@ class Customer:
 
     @property
     def demand_l(self) -> int:
-        """今日この需要家に降ろす量の合計。
-
-        対象は「2日先までに発注点を割るタンク」だけ（Tank.needs_topup）。
-        余裕のあるタンクは触らない。
-
-        v0（単槽モデル）では油種を区別せず合計だけを見る。W2 で
-        「どの槽にどの油種を積むか」に分解する。
-        """
-        return sum(t.topup_l for t in self.tanks if t.needs_topup)
+        """今日この需要家に降ろす量の合計（demand_by_product の合計）。"""
+        return sum(self.demand_by_product().values())
 
     @property
     def is_mandatory(self) -> bool:
-        """必須訪問か。1本でも発注点を割っていれば必須（制約4）。"""
-        return any(t.is_below_reorder for t in self.tanks)
+        """必須訪問か。**誰の約束かで決める。**
+
+            受入見送り  → 必須にしない（行っても降ろせない。需要家の意思）
+            発注配送    → 発注があれば必須（需要家の約束）
+            計画配送    → 発注点割れで必須（**運送会社側の約束**）
+            どの先でも  → 欠品の直前なら必須（今日行かないと明日より先に空になる）
+
+        以前は「1本でも発注点を割っていれば必須」で、受入見送りも発注配送も
+        区別していなかった。それだと値下げ前に在庫を意図的に下げている
+        需要家へ、**断られても配車する**計画が出る。
+
+        一方で、発注点割れを一律に任意訪問へ落とすのも誤りだった（2026-09-11
+        に試して撤回）。計画配送の先は「需要見込みで運ぶ」と運送会社が
+        引き受けている先なので、発注点を割らせないのはこちらの責任になる。
+        任意にすると、在庫あと1.5日の先を「車を1台増やすより明日に回すほうが
+        安い」と判断して落とした。1日だけを見るモデルには、翌日その先が
+        欠品寸前になるコストが見えない。
+
+        在庫が需要家の意思を代理できないのは、**需要家が意思を示した先**
+        （見送り・発注配送）に限る。
+        """
+        return self.mandatory_basis is not None
+
+    @property
+    def mandatory_basis(self) -> str | None:
+        """必須にする理由。order / planned / stockout / None。説明文と診断が使う。"""
+        if not self.accepts_delivery:
+            return None
+        if self.orders:
+            return "order"
+        if not self.ordering and any(t.is_below_reorder and t.topup_l > 0 for t in self.tanks):
+            return "planned"
+        if any(t.stockout_before_next_delivery and t.topup_l > 0 for t in self.tanks):
+            return "stockout"
+        return None
+
+    @property
+    def declined_at_risk(self) -> bool:
+        """受入を見送っているのに、在庫が欠品に向かっているか。
+
+        **計画では救えない**（行っても降ろせない）ので、配車せずに知らせる。
+        誰にどう伝えるかはエージェント層の仕事。
+        """
+        return not self.accepts_delivery and any(
+            t.is_below_reorder or t.stockout_before_next_delivery for t in self.tanks
+        )
 
     def demand_by_product(self) -> dict[Product, int]:
-        """油種ごとの必要量。W2 の多コンパートメント割当が使う。"""
+        """今日この需要家に降ろす量（油種ごと）。
+
+            受入見送り  → 何も降ろさない
+            発注の油種  → 発注量（入りきらない分は降ろせないので空き容量まで）
+            欠品の直前  → 空き容量まで（発注の有無によらない。欠品は最上位）
+            計画配送    → 2日先までに発注点を割るタンクを空き容量まで
+                          （Tank.needs_topup。余裕のあるタンクは触らない）
+
+        発注配送の先で発注の無い油種は、欠品の直前でない限り触らない。
+        何を入れるかは需要家が決めているため。
+        """
+        if not self.accepts_delivery:
+            return {}
+        ordered = dict(self.orders)
         out: dict[Product, int] = {}
         for t in self.tanks:
-            if t.needs_topup:
-                out[t.product] = out.get(t.product, 0) + t.topup_l
+            if t.product in ordered:
+                q = min(ordered[t.product], t.topup_l)
+            elif t.stockout_before_next_delivery:
+                q = t.topup_l
+            elif not self.ordering and t.needs_topup:
+                q = t.topup_l
+            else:
+                q = 0
+            if q > 0:
+                out[t.product] = out.get(t.product, 0) + q
         return out
 
     def min_days_to_empty(self) -> float:

@@ -181,3 +181,23 @@ def test_every_estimate_fits_under_the_per_request_cap():
     """
     for kind, usd in ledger.ESTIMATES.items():
         assert usd <= ledger.MAX_USD_PER_REQUEST, (kind, usd)
+
+
+
+def test_declined_customers_are_accepted_and_validated():
+    """受入見送りを API から渡せる。名簿に無い ID は 400 で落とす。"""
+    ok = client.post(
+        "/api/plan",
+        json={"seed": 20261015, "declined_customers": ["c03"], "mode": "fast"},
+    )
+    assert ok.status_code == 200
+    body = ok.json()
+    assert [d["customer_id"] for d in body["diagnostics"]["declined"]] == ["c03"]
+    visited = {
+        st["customer_id"]
+        for vd in body["vehicle_days"] for t in vd["trips"] for st in t["stops"]
+    }
+    assert "c03" not in visited
+
+    bad = client.post("/api/plan", json={"declined_customers": ["c99"], "mode": "fast"})
+    assert bad.status_code == 400

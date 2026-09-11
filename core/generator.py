@@ -83,6 +83,9 @@ class CustomerSpec:
     #: 立地や規模では決まらない。ENEOS は日石と三菱の合流でできているので、
     #: 同じ看板の下に配管の違う2系統のSSが混在している。
     piping_inch: int = 3
+    #: 自分で発注する先か（発注配送）。False なら計画配送（元売・運送会社が
+    #: 需要見込みで運ぶ）。
+    ordering: bool = False
 
 
 #: 重要家15軒。引き継ぎ文書 §4.2 の4類型を「1回のデモで全制約系が見える」よう配分。
@@ -90,11 +93,15 @@ class CustomerSpec:
 #:
 #: 配管4インチ（旧三菱系）はGS12軒のうち4軒に置いた。**どの先がそうかは架空**
 #: で、比率（約1/3）も合流時の系列の規模感から置いた仮置。
+#:
+#: 発注配送（ordering=True）は運送会社営業所の3軒と、GSのうち2軒に置いた。
+#: 営業所は自社のトラックに入れる軽油を自分で手配する。**これも仮置**で、
+#: どの先が発注で動くかは確認が取れていない。
 ROSTER: tuple[CustomerSpec, ...] = (
     # --- 広島市中心部・24時間（朝は到達に時間、夜は短時間 → 時間帯係数が効く）
     CustomerSpec("c01", "広島中央SS（24h）", CustomerType.URBAN_GS_24H, 34.3925, 132.4553, piping_inch=4),
     CustomerSpec("c02", "宇品港SS（24h）", CustomerType.URBAN_GS_24H, 34.3620, 132.4620),
-    CustomerSpec("c03", "観音新町SS（24h）", CustomerType.URBAN_GS_24H, 34.3800, 132.4200),
+    CustomerSpec("c03", "観音新町SS（24h）", CustomerType.URBAN_GS_24H, 34.3800, 132.4200, ordering=True),
     # --- 広島市中心部・日中のみ（時間枠×ラッシュの二重縛り）
     CustomerSpec("c04", "温品SS（日中）", CustomerType.URBAN_GS_DAY, 34.4160, 132.5150),
     CustomerSpec("c05", "祇園SS（日中）", CustomerType.URBAN_GS_DAY, 34.4450, 132.4560, piping_inch=4),
@@ -102,12 +109,12 @@ ROSTER: tuple[CustomerSpec, ...] = (
     CustomerSpec("c06", "浜田SS", CustomerType.SANIN_GS, 34.8990, 132.0800, piping_inch=4),
     CustomerSpec("c07", "益田SS", CustomerType.SANIN_GS, 34.6760, 131.8430),
     # --- 運送会社営業所（早朝枠＋軽油中心 → 製品と槽の割当が効く）
-    CustomerSpec("c08", "岩国装束運輸", CustomerType.CARRIER_DEPOT, 34.1720, 132.2200),
-    CustomerSpec("c09", "大竹陸運", CustomerType.CARRIER_DEPOT, 34.2380, 132.2210),
-    CustomerSpec("c10", "廿日市物流センター", CustomerType.CARRIER_DEPOT, 34.3480, 132.3320),
+    CustomerSpec("c08", "岩国装束運輸", CustomerType.CARRIER_DEPOT, 34.1720, 132.2200, ordering=True),
+    CustomerSpec("c09", "大竹陸運", CustomerType.CARRIER_DEPOT, 34.2380, 132.2210, ordering=True),
+    CustomerSpec("c10", "廿日市物流センター", CustomerType.CARRIER_DEPOT, 34.3480, 132.3320, ordering=True),
     # --- 郊外GS（灯油比率が高くタンクが小さい → 在庫トリガーが頻繁に発火）
     CustomerSpec("c11", "周東SS", CustomerType.SUBURBAN_GS, 34.1020, 132.1360),
-    CustomerSpec("c12", "錦町SS", CustomerType.SUBURBAN_GS, 34.3300, 132.0000),
+    CustomerSpec("c12", "錦町SS", CustomerType.SUBURBAN_GS, 34.3300, 132.0000, ordering=True),
     CustomerSpec("c13", "玖珂SS", CustomerType.SUBURBAN_GS, 34.1380, 132.1240, piping_inch=4),
     CustomerSpec("c14", "湯来SS", CustomerType.SUBURBAN_GS, 34.4720, 132.2560),
     CustomerSpec("c15", "吉和SS", CustomerType.SUBURBAN_GS, 34.4560, 132.1200),
@@ -331,12 +338,23 @@ def _make_tanks(
     return tuple(tanks)
 
 
+def _make_orders(tanks: tuple[Tank, ...]) -> tuple[tuple[Product, int], ...]:
+    """発注配送の先が前日に出す発注。
+
+    需要家は自分の在庫を見て、2日先までに発注点を割る油種を満タン近くまで
+    頼む、とした。**乱数を使わない**ので、発注配送の先を増減しても同じ
+    seed の在庫は変わらない。
+    """
+    return tuple((t.product, t.topup_l) for t in tanks if t.needs_topup)
+
+
 def generate(
     *,
     seed: int = 20261015,
     date: str = "2026-10-15",
     season: str = "winter",
     absent_drivers: tuple[str, ...] = (),
+    declined_customers: tuple[str, ...] = (),
 ) -> Scenario:
     """1日ぶんの配車問題を作る。
 
@@ -345,6 +363,10 @@ def generate(
         date: 対象日（表示と記録のため。計算には使わない）。
         season: winter / spring / summer / autumn。
         absent_drivers: 欠勤する乗務員のID。デモ4（乗務員欠勤）で使う。
+        declined_customers: 今日の受入を見送る需要家のID。値下げ前に在庫を
+            下げたい需要家など。**事象なので外から与える**（生成器が勝手に
+            作ると、見送りを注入したから計画が変わったのか、たまたまそういう
+            日だったのかが切り分けられなくなる）。
 
     Returns:
         Scenario。ソルバーにもエージェント層にもこれを渡す。
@@ -359,11 +381,19 @@ def generate(
             f"未知の季節: {season!r}（{'/'.join(SEASON_MULTIPLIER)} のいずれか）"
         )
 
+    known = {spec.id for spec in ROSTER}
+    unknown = [cid for cid in declined_customers if cid not in known]
+    if unknown:
+        # 綴り違いを黙って通すと、見送りが効かないまま「見送りを入れた計画」
+        # として読まれる。
+        raise ValueError(f"名簿に無い需要家: {unknown}")
+
     rng = random.Random(seed)
 
     customers = []
     for spec in ROSTER:
         profile = PROFILES[spec.type]
+        tanks = _make_tanks(rng, spec.type, season)
         customers.append(
             Customer(
                 id=spec.id,
@@ -371,7 +401,7 @@ def generate(
                 type=spec.type,
                 lat=spec.lat,
                 lon=spec.lon,
-                tanks=_make_tanks(rng, spec.type, season),
+                tanks=tanks,
                 window_open_min=hhmm_to_minutes(profile.window_open),
                 window_close_min=hhmm_to_minutes(profile.window_close),
                 accepts_trailer=(
@@ -379,6 +409,9 @@ def generate(
                     and spec.id not in RIGID_ONLY_CUSTOMERS
                 ),
                 bore_inch=min(HOSE_INCH, spec.piping_inch),
+                ordering=spec.ordering,
+                orders=_make_orders(tanks) if spec.ordering else (),
+                accepts_delivery=spec.id not in declined_customers,
             )
         )
 

@@ -36,6 +36,10 @@ def main() -> int:
         "--absent", action="append", default=[], help="欠勤する乗務員ID（例 d1）"
     )
     ap.add_argument(
+        "--decline", action="append", default=[],
+        help="今日の受入を見送る需要家ID（例 c03）。値下げ前など",
+    )
+    ap.add_argument(
         "--fast",
         action="store_true",
         help="実時間で打ち切る（--time-limit 秒）。既定は再現モード"
@@ -51,13 +55,16 @@ def main() -> int:
         date=args.date,
         season=args.season,
         absent_drivers=tuple(args.absent),
+        declined_customers=tuple(args.decline),
     )
     matrix = build_matrix(scenario.depot, scenario.customers)
 
     if args.verbose:
         print("=== 当日の需要 ===")
         for c in scenario.customers:
-            mark = "必須" if c.is_mandatory else "任意"
+            mark = {"order": "必須(発注)", "planned": "必須(計画)", "stockout": "必須(欠品)"}.get(
+                c.mandatory_basis or "", "見送り" if not c.accepts_delivery else "任意"
+            )
             days = c.min_days_to_empty()
             print(
                 f"  [{mark}] {c.name:<20} {c.demand_l / 1000:5.1f}kL"
