@@ -131,6 +131,13 @@ python -m venv .venv
 .venv/Scripts/python.exe -m scripts.plan_day --season summer --seed 7 --absent d1
 ```
 
+見込みより売れた先を足す（連休・寒波。`c02:2` は全油種を見込みの2日ぶん、
+`c02:kerosene:1.5` は灯油だけ1.5日ぶん）:
+
+```bash
+.venv/Scripts/python.exe -m scripts.plan_day --date 2026-10-16 --sold-more c02:regular:2
+```
+
 API を立てる:
 
 ```bash
@@ -140,7 +147,12 @@ API を立てる:
 | 経路 | 用途 |
 |---|---|
 | `GET /api/healthz` | 生存確認。設定とコスト台帳のバックエンドを返す |
-| `POST /api/plan` | 当日の配車を組む。`mode` は `reproducible`（既定）か `fast` |
+| `POST /api/plan` | 当日の配車を組む。`mode` は `reproducible`（既定）か `fast`。朝から分かっていた事象は `sold_more` |
+| `POST /api/replan` | 当日の発注（発注システムかFAX）を差し込んで組み直す。日中に分かった事象は `sold_more_now` |
+| `POST /api/intake/fax` | FAX画像を読み、読めたら組み直す（Gemini は写すだけ） |
+| `POST /api/intake/note` | 配車係のメモを読む。電話の連絡は予告として試算だけ |
+| `POST /api/return` | 持ち戻りへの手を優先順に出す |
+| `GET /api/escapes` | 直近30日の逃げ道と、恒常化の恐れ |
 | `GET /api/scenario` | 需要側だけを見る（どこが切迫しているか） |
 | `GET /api/usage` | その日のコスト使用状況と上限 |
 

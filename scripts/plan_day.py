@@ -20,6 +20,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from core.domain import minutes_to_hhmm  # noqa: E402
+from core.events import parse_sold_more  # noqa: E402
 from core.generator import generate  # noqa: E402
 from core.solver import DEFAULT_TIME_LIMIT_S, SolveMode, format_plan_ja, solve  # noqa: E402
 from core.travel import build_matrix  # noqa: E402
@@ -40,6 +41,11 @@ def main() -> int:
         help="今日の受入を見送る需要家ID（例 c03）。値下げ前など",
     )
     ap.add_argument(
+        "--sold-more", action="append", default=[],
+        help="見込みより売れた先（連休・寒波）。c02:2＝全油種2日ぶん、"
+        "c02:kerosene:1.5＝灯油だけ1.5日ぶん。朝の計画より前に分かっていたとき",
+    )
+    ap.add_argument(
         "--fast",
         action="store_true",
         help="実時間で打ち切る（--time-limit 秒）。既定は再現モード"
@@ -50,13 +56,18 @@ def main() -> int:
     ap.add_argument("--verbose", action="store_true", help="需要と車両の内訳も出す")
     args = ap.parse_args()
 
-    scenario = generate(
-        seed=args.seed,
-        date=args.date,
-        season=args.season,
-        absent_drivers=tuple(args.absent),
-        declined_customers=tuple(args.decline),
-    )
+    try:
+        scenario = generate(
+            seed=args.seed,
+            date=args.date,
+            season=args.season,
+            absent_drivers=tuple(args.absent),
+            declined_customers=tuple(args.decline),
+            sold_more=tuple(parse_sold_more(s) for s in args.sold_more),
+        )
+    except ValueError as exc:
+        print(f"入力の誤り: {exc}", file=sys.stderr)
+        return 2
     matrix = build_matrix(scenario.depot, scenario.customers)
 
     if args.verbose:

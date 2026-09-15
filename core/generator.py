@@ -47,6 +47,7 @@ from core.domain import (
     hhmm_to_minutes,
     unload_minutes,
 )
+from core.events import SoldMore, sell_more, validate as validate_events
 from core.travel import leg_minutes
 
 # ---------------------------------------------------------------------------
@@ -446,6 +447,7 @@ def generate(
     season: str = "winter",
     absent_drivers: tuple[str, ...] = (),
     declined_customers: tuple[str, ...] = (),
+    sold_more: tuple[SoldMore, ...] = (),
 ) -> Scenario:
     """1日ぶんの配車問題を作る。
 
@@ -458,6 +460,10 @@ def generate(
             下げたい需要家など。**事象なので外から与える**（生成器が勝手に
             作ると、見送りを注入したから計画が変わったのか、たまたまそういう
             日だったのかが切り分けられなくなる）。
+        sold_more: 見込みより売れた先（連休・値上げ前・寒波）。**朝の計画より前に
+            分かっていた**ときに使う。日中に分かったなら replan に渡す。在庫を下げる
+            のは乱数を引いたあとなので、事象の無い先は事象なしの日と完全に同じになる。
+            在庫が発注点を割れば、計画配送の日でない先には発注が入る。
 
     Returns:
         Scenario。ソルバーにもエージェント層にもこれを渡す。
@@ -478,6 +484,12 @@ def generate(
         # 綴り違いを黙って通すと、見送りが効かないまま「見送りを入れた計画」
         # として読まれる。
         raise ValueError(f"名簿に無い需要家: {unknown}")
+    unknown = sorted({e.customer_id for e in sold_more} - known)
+    if unknown:
+        raise ValueError(f"名簿に無い需要家: {unknown}")
+    events_by_customer: dict[str, list[SoldMore]] = {}
+    for e in sold_more:
+        events_by_customer.setdefault(e.customer_id, []).append(e)
 
     rng = random.Random(seed)
     n = (datetime.date.fromisoformat(date) - EPOCH).days
@@ -501,7 +513,8 @@ def generate(
             # 1日2.2kLしか使わない営業所が毎日15kLずつ頼み、発注が計画配送より
             # 大きくなった。量が消費と釣り合わない在庫の作り方は使えない。
             days_since = rng.randint(1, PLANNED_INTERVAL_DAYS)
-            tanks = _cycle_tanks(rng, spec, season, days_since)
+            tanks = sell_more(_cycle_tanks(rng, spec, season, days_since),
+                              events_by_customer.get(spec.id, ()))
             orders = (
                 tuple((t.product, t.topup_l) for t in tanks if t.topup_l > 0)
                 if open_today and days_since == PLANNED_INTERVAL_DAYS else ()
@@ -513,7 +526,8 @@ def generate(
             phase = phases[spec.id]
             days_since = ((op - phase - 1) % PLANNED_INTERVAL_DAYS) + 1
             due = open_today and (op - phase) % PLANNED_INTERVAL_DAYS == 0
-            tanks = _cycle_tanks(rng, spec, season, days_since)
+            tanks = sell_more(_cycle_tanks(rng, spec, season, days_since),
+                              events_by_customer.get(spec.id, ()))
             if due:
                 daily = _planned_daily(spec, season)
                 planned = tuple(
@@ -545,6 +559,8 @@ def generate(
                 accepts_delivery=spec.id not in declined_customers,
             )
         )
+    # 日数の範囲・タンクの無い油種を黙って通さない（名簿の綴りは上で確かめた）
+    validate_events(customers, tuple(sold_more))
 
     drivers = tuple(
         Driver(

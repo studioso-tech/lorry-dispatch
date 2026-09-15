@@ -29,6 +29,7 @@ from app.meter import CostMeter
 from core.domain import minutes_to_hhmm
 from core.generator import generate
 from core.domain import Product
+from core.events import MAX_EXTRA_DAYS, SoldMore
 from core.replan import NewOrder, format_replan_ja, replan
 from core.returns import RESPONSIBILITY_JA, ReturnEvent, format_return_ja, handle_return
 from core.solver import Plan, SolveMode, VehicleDay, format_plan_ja, solve
@@ -148,6 +149,18 @@ def model_check(subject: str = "modelcheck") -> dict:
 # ---------------------------------------------------------------------------
 
 
+class SoldMoreIn(BaseModel):
+    """見込みより売れた（連休・値上げ前・寒波）。当日発注の引き金になる事象。"""
+
+    customer_id: str
+    extra_days: float = Field(gt=0, le=MAX_EXTRA_DAYS,
+                              description="見込みの何日ぶん多く売れたか（例 2＝連休で2日ぶん多く出た）")
+    product: Product | None = Field(default=None, description="油種。省くと全油種")
+
+    def to_event(self) -> SoldMore:
+        return SoldMore(self.customer_id, self.extra_days, self.product)
+
+
 class PlanRequest(BaseModel):
     """当日の配車を組む要求。
 
@@ -166,6 +179,10 @@ class PlanRequest(BaseModel):
         default_factory=list,
         description="今日の受入を見送る需要家ID（例 ['c03']）。配車しない",
     )
+    sold_more: list[SoldMoreIn] = Field(
+        default_factory=list,
+        description="朝の計画より前に分かっていた「見込みより売れた」。日中に分かったものは sold_more_now へ",
+    )
     subject: str = Field(default="demo", description="利用者の識別子。台帳の単位")
     mode: SolveMode = Field(
         default=SolveMode.REPRODUCIBLE,
@@ -174,6 +191,25 @@ class PlanRequest(BaseModel):
             "時間は読めない）。fast: 時間で打ち切る（再現は保証しない）"
         ),
     )
+
+
+def _generate(req: PlanRequest):
+    """要求の日の条件（欠勤・受入見送り・朝から分かっていた事象）で問題を作る。"""
+    return generate(
+        seed=req.seed,
+        date=req.date,
+        season=req.season,
+        absent_drivers=tuple(req.absent_drivers),
+        declined_customers=tuple(req.declined_customers),
+        sold_more=tuple(e.to_event() for e in req.sold_more),
+    )
+
+
+#: 日中に分かった「見込みより売れた」。組み直しの要求だけが持つ。
+SOLD_MORE_NOW_DESCRIPTION = (
+    "日中に分かった「見込みより売れた」（FAXの但し書き等）。朝の計画は見込みのまま、"
+    "組み直しで初めて在庫に当てる"
+)
 
 
 def _vehicle_days_to_list(vehicle_days: tuple[VehicleDay, ...]) -> list[dict]:
@@ -278,13 +314,7 @@ def make_plan(req: PlanRequest) -> dict:
         raise HTTPException(status_code=429, detail=str(exc)) from exc
 
     try:
-        scenario = generate(
-            seed=req.seed,
-            date=req.date,
-            season=req.season,
-            absent_drivers=tuple(req.absent_drivers),
-            declined_customers=tuple(req.declined_customers),
-        )
+        scenario = _generate(req)
     except ValueError as exc:
         ledger.release(req.subject, amount)
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -347,10 +377,11 @@ class ReplanRequest(PlanRequest):
     now: str = Field(pattern="^([01][0-9]|2[0-3]):[0-5][0-9]$", description="いまの時刻 HH:MM")
     orders: list[OrderIn] = Field(min_length=1)
     spot_standby: int = Field(default=0, ge=0, le=10, description="いま呼べる待機の非専属の台数")
+    sold_more_now: list[SoldMoreIn] = Field(default_factory=list, description=SOLD_MORE_NOW_DESCRIPTION)
 
 
 def _replan_body(req: PlanRequest, now: str, orders: list[NewOrder], spot_standby: int,
-                 *, dry_run: bool, plan_id: str) -> dict:
+                 *, dry_run: bool, plan_id: str, sold_more_now: list[SoldMoreIn] = ()) -> dict:
     """朝の計画を再現モードで組み直し、当日の発注を差し込む。
 
     朝の計画を**再現モードで組み直す**のは、審査員が /api/plan で見た朝の計画と
@@ -359,13 +390,8 @@ def _replan_body(req: PlanRequest, now: str, orders: list[NewOrder], spot_standb
 
     試算（dry_run）でなければ、使った逃げ道を記録する（恒常化の監視が数える）。
     """
-    scenario = generate(
-        seed=req.seed,
-        date=req.date,
-        season=req.season,
-        absent_drivers=tuple(req.absent_drivers),
-        declined_customers=tuple(req.declined_customers),
-    )
+    scenario = _generate(req)
+    events_now = tuple(e.to_event() for e in sold_more_now)
     base = solve(
         scenario,
         matrix=build_matrix(scenario.depot, scenario.customers),
@@ -381,12 +407,14 @@ def _replan_body(req: PlanRequest, now: str, orders: list[NewOrder], spot_standb
         spot_standby=spot_standby,
         time_limit_s=settings.solve_time_limit_s,
         dry_run=dry_run,
+        sold_more=events_now,
     )
     if not dry_run and result.escapes:
         escapes.record(scenario.date, result.escapes, plan_id=plan_id)
     return {
         "plan_id": plan_id,
         "dry_run": result.dry_run,
+        "sold_more_now": [e.label_ja() for e in events_now],
         "ok": result.ok,
         "summary_ja": result.summary_ja(),
         "text_ja": format_replan_ja(result),
@@ -428,7 +456,8 @@ def make_replan(req: ReplanRequest) -> dict:
             NewOrder(o.customer_id, o.product, o.volume_l, o.source, o.evidence_ref)
             for o in req.orders
         ]
-        body = _replan_body(req, req.now, orders, req.spot_standby, dry_run=False, plan_id=plan_id)
+        body = _replan_body(req, req.now, orders, req.spot_standby, dry_run=False, plan_id=plan_id,
+                            sold_more_now=req.sold_more_now)
     except ValueError as exc:
         ledger.release(req.subject, amount)
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -454,6 +483,7 @@ class FaxIntakeRequest(PlanRequest):
     image_base64: str = Field(min_length=16, description="FAX 画像（base64）")
     mime: str = Field(default="image/png", pattern="^(image/(png|jpeg)|application/pdf)$")
     spot_standby: int = Field(default=0, ge=0, le=10)
+    sold_more_now: list[SoldMoreIn] = Field(default_factory=list, description=SOLD_MORE_NOW_DESCRIPTION)
 
 
 class NoteIntakeRequest(PlanRequest):
@@ -462,6 +492,7 @@ class NoteIntakeRequest(PlanRequest):
     now: str = Field(pattern="^([01][0-9]|2[0-3]):[0-5][0-9]$")
     note: str = Field(min_length=2, max_length=500)
     spot_standby: int = Field(default=0, ge=0, le=10)
+    sold_more_now: list[SoldMoreIn] = Field(default_factory=list, description=SOLD_MORE_NOW_DESCRIPTION)
 
 
 def _intake_response(req: PlanRequest, got: "intake.Intake", now: str, spot_standby: int,
@@ -487,7 +518,8 @@ def _intake_response(req: PlanRequest, got: "intake.Intake", now: str, spot_stan
         base["action"] = "confirm"
         base["summary_ja"] = "確認が要ります: " + " / ".join(got.issues or ["発注が読み取れませんでした"])
         return base
-    replanned = _replan_body(req, now, got.orders, spot_standby, dry_run=got.notice, plan_id=plan_id)
+    replanned = _replan_body(req, now, got.orders, spot_standby, dry_run=got.notice, plan_id=plan_id,
+                             sold_more_now=getattr(req, "sold_more_now", []))
     base["action"] = "dry_run" if got.notice else "replanned"
     base["replan"] = replanned
     base["summary_ja"] = replanned["summary_ja"]
@@ -562,11 +594,7 @@ def make_return(req: ReturnRequest) -> dict:
     費用は元売の管理責任で、運送会社・SSへの請求は無い（実務）。
     """
     try:
-        scenario = generate(
-            seed=req.seed, date=req.date, season=req.season,
-            absent_drivers=tuple(req.absent_drivers),
-            declined_customers=tuple(req.declined_customers),
-        )
+        scenario = _generate(req)
         plan = solve(scenario, matrix=build_matrix(scenario.depot, scenario.customers),
                      workers=settings.solve_workers, mode=SolveMode.REPRODUCIBLE)
         r = handle_return(scenario, plan, ReturnEvent(req.vehicle_id, req.customer_id,

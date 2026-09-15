@@ -47,6 +47,7 @@ from core.domain import (
     VehicleClass,
     minutes_to_hhmm,
 )
+from core.events import SoldMore, sell_more, validate as validate_events
 from core.solver import Plan, SolveMode, Trip, Unserved, VehicleDay, solve
 from core.travel import build_matrix
 
@@ -185,6 +186,7 @@ def replan(
     time_limit_s: float = 20.0,
     mode: SolveMode = SolveMode.FAST,
     dry_run: bool = False,
+    sold_more: tuple[SoldMore, ...] = (),
 ) -> ReplanResult:
     """朝の計画 base に、当日の発注 orders を差し込む。
 
@@ -197,12 +199,20 @@ def replan(
         time_limit_s: 求解の打ち切り（FAST のとき）。
         mode: 既定は FAST。組み直しは「いま組み直してほしい」要求なので時間で切る。
         dry_run: 試算か。予告（電話の連絡など）を入れられるのは試算だけ。
+        sold_more: **日中に分かった**「見込みより売れた」（FAXの但し書き等）。
+            朝の計画は見込みで組まれているので、ここで初めて在庫に当てる。
+            積込済みの便が降ろした量を**朝の見込みで**差し引いてから当てる
+            （先に当てると欠品扱いで降ろす量が変わり、朝の車が積んだ量と合わない）。
 
     Raises:
         ValueError: 名簿に無い需要家、タンクの無い油種、量が0以下の発注。
             黙って捨てると「発注を入れた計画」として読まれるので落とす。
     """
     _validate(scenario, orders)
+    validate_events(scenario.customers, tuple(sold_more))
+    events_by_customer: dict[str, list[SoldMore]] = {}
+    for e in sold_more:
+        events_by_customer.setdefault(e.customer_id, []).append(e)
     notices = [o for o in orders if o.is_notice]
     if notices and not dry_run:
         # **予告で車を動かさない。** 発注は証拠の残る形でしか受けない（実務）。
@@ -250,6 +260,9 @@ def replan(
                 for t in c.tanks
             )
             c2 = replace(c, tanks=tanks, planned=(), orders=())
+        if c.id in events_by_customer:
+            # 日中に分かった「見込みより売れた」。積込済みの便のぶんを差し引いた後に当てる
+            c2 = replace(c2, tanks=sell_more(c2.tanks, events_by_customer[c.id]))
         if c.id in new_by_customer:
             # **発注量どおりに入るとは限らない。** タンクの空き以上は降ろせない。
             # 積込済みの便がこれから同じ先に降ろすなら、空きはさらに小さい。
