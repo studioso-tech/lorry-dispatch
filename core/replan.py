@@ -41,6 +41,7 @@ from dataclasses import dataclass, replace
 from core.domain import (
     COMPARTMENT_UNIT_L,
     DROP_STEP_BY_PRODUCT,
+    MIN_STOP_DROP_L,
     Customer,
     Driver,
     Product,
@@ -60,9 +61,9 @@ SPOT_LEAD_MIN = 60
 #: 組み直しで、午後に回れる便の上限（車1台あたり）。
 REPLAN_MAX_TRIPS = 3
 
-#: これより少ない量のためには車を出さない（いちばん小さい槽＝2kL）。
-#: 発注量どおりに入らず、入る量がこれに満たないときは、SSに確認してからにする。
-MIN_DROP_L = COMPARTMENT_UNIT_L
+#: これより少ない量のためには車を出さない。**2kLだけの荷卸しはしない**（実務）ので、
+#: 1軒に降ろす合計がこれに満たなければ、SSに確認してからにする。
+MIN_DROP_L = MIN_STOP_DROP_L
 
 #: 小口の発注とみなす量（1軒ぶんの合計）。**仮置。** 実務: 特殊な油種でなければ
 #: 2kL・4kLの発注はあり得ず、小口の発注は翌日の計画配送を前倒しして合わせて運ぶ。
@@ -352,8 +353,8 @@ def replan(
                 id=f"s{k + 1}",
                 name=f"非専属{k + 1}（単車 16kL）",
                 vehicle_class=VehicleClass.RIGID,
-                # 全部4kL槽の車は存在しない（実務）。4号車と同じ 2/4/4/2/4（仮置）
-                compartments_l=(2_000, 4_000, 4_000, 2_000, 4_000),
+                # 単車は2kL槽が多い（実務）。4号車と同じ区割り（仮置）
+                compartments_l=(2_000, 2_000, 2_000, 2_000, 4_000, 4_000),
                 driver_id=did,
                 spot=True,
                 available_from_min=now_min + SPOT_LEAD_MIN,

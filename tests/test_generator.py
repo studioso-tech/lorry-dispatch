@@ -93,10 +93,14 @@ def test_planned_delivery_comes_every_three_operating_days():
             due.setdefault(c.id, [])
             due[c.id].append(1 if c.planned else 0)
     for cid, marks in due.items():
-        # 営業日だけを並べると、きっちり3日に1回
-        assert sum(marks) == len(marks) // PLANNED_INTERVAL_DAYS, cid
         hits = [i for i, m in enumerate(marks) if m]
-        assert all(b - a == PLANNED_INTERVAL_DAYS for a, b in zip(hits, hits[1:])), cid
+        assert hits, cid
+        # 配送の日は3営業日の刻みの上にだけ来る（間隔は3日か、その倍数）
+        assert all((b - a) % PLANNED_INTERVAL_DAYS == 0 for a, b in zip(hits, hits[1:])), cid
+        # **量がまとまらない回は運ばない。** 主要3油種は4kL槽の単位でしか運ばず、
+        # 3日ぶんが4kLに満たない小さなSSでは、次の回にまとめる（2026-09-16）。
+        # それでも2回に1回は必ず運ぶ（6営業日以内）
+        assert all(b - a <= 2 * PLANNED_INTERVAL_DAYS for a, b in zip(hits, hits[1:])), cid
 
 
 def test_mandatory_depends_on_whose_promise_it_is():
@@ -268,11 +272,13 @@ def test_planned_volume_is_steady_monday_to_saturday():
             continue
         s = generate(seed=2000 + k, date=d.isoformat(), season="winter")
         planned.append(sum(c.demand_l for c in s.customers if c.planned))
-    cv = statistics.pstdev(planned) / statistics.mean(planned)
-    # 名簿が15軒と小さいので、周期の起点の割り付けで±1〜2割の凸凹は残る。
-    # さらに主要3油種は4kL槽の単位で運び、端数を次回へ持ち越すので、1軒ぶんの量が
-    # 回ごとに4kL揺れる（1日40kL前後に対して1割ぶん）。2026-09-16 に0.20→0.25
-    assert cv < 0.25, cv
+    # **週ごとに見る。** 主要3油種は4kL槽の単位でしか運ばず、まとまらない回は
+    # 次へ持ち越す（2026-09-16）ので、1日ずつ見ると4kL刻みの凸凹が出る。名簿が
+    # 15軒と小さいぶん、その凸凹は1日40kL前後に対して大きく見える。運ぶ量が
+    # ほぼ一定という実務の姿は、週（月〜土）の合計で見るのが正しい。
+    weeks = [sum(planned[i:i + 6]) for i in range(0, len(planned), 6)]
+    cv = statistics.pstdev(weeks) / statistics.mean(weeks)
+    assert cv < 0.15, (cv, weeks)
 
 
 def test_closed_customers_get_nothing_on_sunday():

@@ -106,9 +106,12 @@ COMPARTMENT_MAX_L = 4_000
 #: 実在する槽の大きさ。**2kL と 4kL の組合せだけ。**（実務）
 #:
 #: 法令は上限（4kL）しか定めていないが、実際のローリーはこの2種類を
-#: 組み合わせて作られている。たとえば20kL車なら
+#: 組み合わせて作られている。たとえば20kL車なら 2/4/2/4/4/2/2（7槽）。
 #:
-#:     2/4/2/4/4/2/2（7槽）   2/4/4/2/4/4（6槽）
+#: **2kL槽は4kL槽より少なくならない**（実務・2026-09-16）。いろいろな油種・量の
+#: 注文に応えるには小さい槽が要るため。例外は空港向け（Jet A-1 の単一油種）で、
+#: 4kL槽が多いこともあるが、他の用途に使いにくいので二次配送の運送会社は選ばない。
+#: **ここでは空港向けは扱わない。**
 #:
 #: 以前は 3kL の槽を置いていたが、そんな槽は無い。
 COMPARTMENT_SIZES_L: tuple[int, ...] = (2_000, 4_000)
@@ -240,6 +243,12 @@ DROP_STEP_BY_PRODUCT: dict[Product, int] = {
     Product.KEROSENE: 4_000,
     Product.PREMIUM: 2_000,
 }
+
+
+#: 1軒に降ろす1回あたりの最小（合計）。**2kLだけの荷卸しはしない**（実務・2026-09-16）。
+#: よほどの特殊事情が無ければ無く、流下の時間より準備・手仕舞の手間のほうが大きい。
+#: 量がここに満たない回は運ばず、次の配送にまとめる。**欠品の直前だけは例外**（緊急）。
+MIN_STOP_DROP_L = 4_000
 
 
 def whole_drops_l(product: Product, volume_l: int) -> int:
@@ -552,6 +561,11 @@ class Customer:
                 q = whole_compartments_l(t.topup_l)     # 緊急: 2kLの単位まで
             if q > 0:
                 out[t.product] = out.get(t.product, 0) + q
+        # **2kLだけの荷卸しはしない**（実務）。まとまらない回は運ばず次へ回す。
+        # 欠品の直前だけは緊急なので運ぶ。
+        urgent = any(t.stockout_before_next_delivery for t in self.tanks)
+        if not urgent and 0 < sum(out.values()) < MIN_STOP_DROP_L:
+            return {}
         return out
 
     def load_units(self) -> tuple[int, int, int]:
@@ -655,6 +669,16 @@ class Vehicle:
             raise ValueError(
                 f"{self.id}: 2kL槽と4kL槽の両方を持つ（全部同じ大きさの槽の車は無い）。"
                 f"{'/'.join(str(c // 1000) for c in self.compartments_l)} は不可"
+            )
+        n2 = self.compartments_l.count(2_000)
+        n4 = self.compartments_l.count(4_000)
+        if n2 < n4:
+            # **2kL槽は4kL槽より少なくならない**（実務・2026-09-16）。単車もトレーラーも
+            # 同じ。4kL槽のほうが多いのは空港向け（単一油種）の特殊車で、二次配送の
+            # 運送会社は選ばない
+            raise ValueError(
+                f"{self.id}: 2kL槽は4kL槽以上（2kL{n2}本・4kL{n4}本の区割りは無い。"
+                "4kL槽が多いのは空港向けの特殊車)"
             )
         allowed = CAPACITIES_L[self.vehicle_class]
         total = sum(self.compartments_l)

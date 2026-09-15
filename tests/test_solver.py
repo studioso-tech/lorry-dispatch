@@ -383,7 +383,7 @@ def test_only_real_capacities_exist():
     with pytest.raises(ValueError, match="kL 積は無い"):
         Vehicle(
             id="bad", name="10kL", vehicle_class=VehicleClass.RIGID,
-            compartments_l=(4_000, 4_000, 2_000), driver_id="d1",
+            compartments_l=(2_000, 2_000, 4_000, 2_000), driver_id="d1",
         )
 
 
