@@ -113,6 +113,50 @@ COMPARTMENT_MAX_L = 4_000
 #: 以前は 3kL の槽を置いていたが、そんな槽は無い。
 COMPARTMENT_SIZES_L: tuple[int, ...] = (2_000, 4_000)
 
+#: 積み降ろしの刻み。**積込は2kL・4kL槽の単位で行う**（実務・2026-09-15）。
+#:
+#: 槽は満量で積み、**その槽の全量が入らなければその槽は降ろさない**（2026-09-12）。
+#: したがって降ろす量は油種ごとに必ず2kLの倍数になる。以前は空き容量まで端数
+#: （10.6kL・3.7kL 等）で運んでいて、実際には積めない量の計画を出していた。
+COMPARTMENT_UNIT_L = min(COMPARTMENT_SIZES_L)
+
+
+def whole_compartments_l(volume_l: int) -> int:
+    """槽の単位に切り捨てる。**切り上げない**——空き容量を超えては降ろせないため。"""
+    return max(0, volume_l) // COMPARTMENT_UNIT_L * COMPARTMENT_UNIT_L
+
+
+def compartment_units(volume_by_product: dict) -> tuple[int, int]:
+    """降ろす量を槽で数える。(2kL単位の数, そのうち4kL槽に回せる組の数)。
+
+    油種ごとに、2kL単位で u 単位なら 4kL槽は最大 u//2 本使える（残りは2kL槽）。
+    1便に積めるかは fits_compartments で判定する。
+    """
+    units = pairs = 0
+    for v in volume_by_product.values():
+        if v <= 0:
+            continue
+        u = v // COMPARTMENT_UNIT_L
+        units += u
+        pairs += u // 2
+    return units, pairs
+
+
+def fits_compartments(compartments_l: tuple[int, ...], units: int, pairs: int) -> bool:
+    """1便ぶんの荷（槽で数えた units, pairs）が、この車の槽に積めるか。
+
+    **槽は満量で積む**ので、2kL単位が奇数の荷は2kL槽を1本は使う。4kL槽に回せる
+    ぶんを4kL槽に詰め（最大 min(4kL槽の数, pairs) 組）、残りを2kL槽で持つ:
+
+        units − 2 × min(4kL槽の数, pairs) ≦ 2kL槽の数
+
+    この詰め方（4kL槽を先に使う）で積めなければ、どう詰めても積めない。
+    合計容量だけを見ると、4kL槽×4の単車に2kLずつ3油種を積める計画が出る。
+    """
+    n4 = sum(1 for c in compartments_l if c == 4_000)
+    n2 = sum(1 for c in compartments_l if c == 2_000)
+    return units - 2 * min(n4, pairs) <= n2
+
 #: 荷卸しの準備と手仕舞（着車・アース・ホース接続・検尺・伝票・収納）。
 #:
 #: 流下そのものとは別にかかる時間。流量の実測と、運送会社が1か所あたりに
@@ -429,7 +473,8 @@ class Customer:
             return None
         if self.demand_l <= 0:
             return None
-        if any(t.stockout_before_next_delivery and t.topup_l > 0 for t in self.tanks):
+        if any(t.stockout_before_next_delivery and whole_compartments_l(t.topup_l) > 0
+               for t in self.tanks):
             return "stockout"
         if self.orders:
             return "order"
@@ -458,6 +503,9 @@ class Customer:
 
         同じ油種に計画と発注が重なったら大きいほう（タンクは1本なので、
         足しても空き容量を超えては入らない）。
+
+        **量は槽の単位（2kLの倍数）に切り捨てる。** 積込は2kL・4kL槽の単位で、
+        槽の全量が入らなければその槽は降ろさない（実務）。空きが3.7kLなら2kL。
         """
         if not self.accepts_delivery or not self.open_today:
             return {}
@@ -472,6 +520,7 @@ class Customer:
                 q = max(q, min(planned[t.product], t.topup_l))
             if t.stockout_before_next_delivery:
                 q = t.topup_l
+            q = whole_compartments_l(q)
             if q > 0:
                 out[t.product] = out.get(t.product, 0) + q
         return out

@@ -37,9 +37,14 @@ def _surge(s, base, n=4):
     served = {st.customer_id for t in base.trips for st in t.stops}
     free = [c for c in s.customers if c.id not in served and c.open_today and c.accepts_delivery]
     orders = []
-    for i, c in enumerate(free[:n]):
+    for c in free:
         t = max(c.tanks, key=lambda t: t.topup_l)
-        orders.append(NewOrder(c.id, t.product, min(6_000, t.topup_l), "system", f"ORD-{i + 1:03d}"))
+        # 発注は槽の単位。4kL槽しかない単車（非専属を含む）でも運べるよう4kL単位で頼む
+        vol = min(8_000, t.topup_l) // 4_000 * 4_000
+        if vol:
+            orders.append(NewOrder(c.id, t.product, vol, "system", f"ORD-{len(orders) + 1:03d}"))
+        if len(orders) == n:
+            break
     return orders
 
 
@@ -94,15 +99,19 @@ def test_without_spot_a_planned_delivery_is_deferred_not_the_order():
     """
     from dataclasses import replace
 
-    from core.domain import Scenario
+    from core.domain import Scenario, compartment_units, fits_compartments, whole_compartments_l
 
     s = generate(seed=20261015, date="2026-10-15", season="winter")
     planned = next(c for c in s.customers if c.planned and c.mandatory_basis == "planned")
     twin = replace(planned, id="c90", name="同じ場所の別のSS", planned=(), orders=())
-    driver = s.driver("d4")
+    # 計画配送の荷を槽に積める車を1台だけ置く（4kL槽だけの単車は2kLの荷を積めない）
+    veh = next(v for v in s.vehicles
+               if (planned.accepts_trailer or not v.is_trailer)
+               and fits_compartments(v.compartments_l, *compartment_units(planned.demand_by_product())))
+    driver = s.driver(veh.driver_id)
     s1 = Scenario(date=s.date, season=s.season, seed=s.seed, depot=s.depot,
                   customers=(planned, twin),
-                  vehicles=tuple(v for v in s.vehicles if v.id == "v4"),
+                  vehicles=(veh,),
                   drivers=s.drivers)
     base = solve(s1, matrix=build_matrix(s1.depot, s1.customers), time_limit_s=TIME_LIMIT_S)
     assert [st.customer_id for t in base.trips for st in t.stops] == [planned.id]
@@ -111,8 +120,9 @@ def test_without_spot_a_planned_delivery_is_deferred_not_the_order():
     s1.drivers = tuple(replace(d, max_duty_min=tight) if d.id == driver.id else d for d in s1.drivers)
 
     product, volume = planned.planned[0]
+    room = next(t.topup_l for t in twin.tanks if t.product is product)
     r = replan(s1, base, now_min=s1.depot.open_min,
-               orders=[NewOrder(twin.id, product, min(volume, twin.tanks[0].topup_l), "system", "ORD-T")])
+               orders=[NewOrder(twin.id, product, whole_compartments_l(min(volume, room)), "system", "ORD-T")])
     assert r.ok, format_replan_ja(r)
     assert [e.customer_id for e in r.escapes] == [planned.id]
     assert r.escapes[0].kind == "defer_planned"

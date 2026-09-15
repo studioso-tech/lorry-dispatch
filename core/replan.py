@@ -39,6 +39,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 
 from core.domain import (
+    COMPARTMENT_UNIT_L,
     Customer,
     Driver,
     Product,
@@ -46,6 +47,7 @@ from core.domain import (
     Vehicle,
     VehicleClass,
     minutes_to_hhmm,
+    whole_compartments_l,
 )
 from core.events import SoldMore, sell_more, validate as validate_events
 from core.solver import Plan, SolveMode, Trip, Unserved, VehicleDay, solve
@@ -59,7 +61,7 @@ REPLAN_MAX_TRIPS = 3
 
 #: これより少ない量のためには車を出さない（いちばん小さい槽＝2kL）。
 #: 発注量どおりに入らず、入る量がこれに満たないときは、SSに確認してからにする。
-MIN_DROP_L = 2_000
+MIN_DROP_L = COMPARTMENT_UNIT_L
 
 #: 発注として受け付ける経路。**証拠の残るものだけ。**（実務）
 ORDER_SOURCES = ("system", "fax")
@@ -272,11 +274,14 @@ def replan(
             room = {t.product: t.topup_l for t in c2.tanks}
             for p, v in new_by_customer[c.id].items():
                 fits = max(0, room.get(p, 0) - merged.get(p, 0))
-                take = min(v, fits)
-                if take < v and take < MIN_DROP_L:
-                    take = 0      # 2kL槽1つにも満たない量のために車は出さない
+                # **槽の単位（2kLの倍数）でしか積めない**（実務）。空きが3.7kLなら2kL、
+                # 2kLに満たなければ車は出さない
+                take = whole_compartments_l(min(v, fits))
                 if take < v:
-                    why = f"タンクの空きが {fits / 1000:.1f}kL しかない"
+                    if v % MIN_DROP_L and fits >= v:
+                        why = f"積込は2kL・4kL槽の単位（発注量が槽の単位になっていない）"
+                    else:
+                        why = f"タンクの空きが {fits / 1000:.1f}kL しかない"
                     if c.id in frozen_visit:
                         vname, at, vol = frozen_visit[c.id]
                         why += f"（{minutes_to_hhmm(at)} に{vname}が {vol / 1000:.1f}kL 降ろす便が積込済み）"

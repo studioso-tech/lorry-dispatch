@@ -57,6 +57,7 @@ import ortools
 from ortools.sat.python import cp_model
 
 from core.domain import (
+    COMPARTMENT_UNIT_L,
     DAY_SHIFT_DEPART_MIN,
     LABOR_BREAK_45_MIN,
     LABOR_BREAK_60_MIN,
@@ -68,6 +69,8 @@ from core.domain import (
     LegClass,
     Scenario,
     Vehicle,
+    compartment_units,
+    fits_compartments,
     minutes_to_hhmm,
 )
 from core.travel import TravelMatrix, build_matrix
@@ -667,8 +670,11 @@ def solve(
         arcs: list[tuple[int, int, cp_model.IntVar]] = []
         for i in range(N):
             if i >= R:
-                # 積載量を超える需要家には、その車では行けない
-                if cust(i).demand_l > veh.capacity_l:
+                # 1軒ぶんでもこの車の槽に積めない需要家には、その車では行けない
+                # （合計容量だけでなく槽の組合せで見る。fits_compartments）
+                if cust(i).demand_l > veh.capacity_l or not fits_compartments(
+                    veh.compartments_l, *compartment_units(cust(i).demand_by_product())
+                ):
                     model.Add(active[v][i] == 0)
                 # **トレーラーが物理的に入れない需要家がある。**
                 # 狭い道・小さい構内・切り返しの余地の無さで決まるので、
@@ -791,6 +797,47 @@ def solve(
             else:
                 model.Add(lv[j] == lv[i] + cust(j).demand_l).OnlyEnforceIf(lit)
         load.append(lv)
+
+    # --- 槽（便ごと）: 合計容量だけでなく、2kL槽と4kL槽の数で積めるか ---------
+    #
+    # **積込は2kL・4kL槽の単位で、槽は満量で積む**（実務）。合計容量だけを見ると、
+    # 4kL槽×4の単車に2kLずつ3油種を積む計画が出る（4kL槽に2kLだけ入れることになる）。
+    #
+    # 積載量と同じく、2kL単位の数 U と「4kL槽に回せる組」の数 H を経路に沿って
+    # 累積し、油槽所を出た直後にリセットする。各立ち寄りで
+    #
+    #     U − 2·z ≦ 2kL槽の数,  z ≦ 4kL槽の数,  z ≦ H
+    #
+    # を満たす z があること（fits_compartments と同じ式）。U − 2·min(4kL槽, H) は
+    # 立ち寄るほど増える一方なので、便の最後で成り立てば途中でも成り立つ。
+    units_of = [compartment_units(c.demand_by_product()) for c in customers]
+    for v, veh in enumerate(fleet):
+        n4 = sum(1 for c in veh.compartments_l if c == 4_000)
+        n2 = sum(1 for c in veh.compartments_l if c == 2_000)
+        if n4 == 0:
+            continue      # 2kL槽だけの車は合計容量の制約と同じ
+        max_u = veh.capacity_l // COMPARTMENT_UNIT_L
+        uv = [None] * N
+        hv = [None] * N
+        for c_idx in range(C):
+            node = R + c_idx
+            uv[node] = model.NewIntVar(0, max_u, f"units_v{v}_n{node}")
+            hv[node] = model.NewIntVar(0, max_u, f"pairs_v{v}_n{node}")
+            z = model.NewIntVar(0, n4, f"z4_v{v}_n{node}")
+            model.Add(z <= hv[node])
+            model.Add(uv[node] - 2 * z <= n2)
+            model.Add(uv[node] == 0).OnlyEnforceIf(active[v][node].Not())
+            model.Add(hv[node] == 0).OnlyEnforceIf(active[v][node].Not())
+        for (i, j), lit in x[v].items():
+            if j < R:
+                continue
+            u_j, h_j = units_of[j - R]
+            if i < R:
+                model.Add(uv[j] == u_j).OnlyEnforceIf(lit)
+                model.Add(hv[j] == h_j).OnlyEnforceIf(lit)
+            else:
+                model.Add(uv[j] == uv[i] + u_j).OnlyEnforceIf(lit)
+                model.Add(hv[j] == hv[i] + h_j).OnlyEnforceIf(lit)
 
     # --- 乗務員の拘束時間・運転時間（車＝人ごと） ---------------------------
     duty = []
