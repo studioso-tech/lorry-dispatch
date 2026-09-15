@@ -113,6 +113,54 @@ COMPARTMENT_MAX_L = 4_000
 #: 以前は 3kL の槽を置いていたが、そんな槽は無い。
 COMPARTMENT_SIZES_L: tuple[int, ...] = (2_000, 4_000)
 
+#: 積み降ろしの刻み。**積込は2kL・4kL槽の単位で行う**（実務・2026-09-15）。
+#:
+#: 槽は満量で積み、**その槽の全量が入らなければその槽は降ろさない**（2026-09-12）。
+#: したがって降ろす量は油種ごとに必ず2kLの倍数になる。以前は空き容量まで端数
+#: （10.6kL・3.7kL 等）で運んでいて、実際には積めない量の計画を出していた。
+COMPARTMENT_UNIT_L = min(COMPARTMENT_SIZES_L)
+
+
+def whole_compartments_l(volume_l: int) -> int:
+    """槽の単位に切り捨てる。**切り上げない**——空き容量を超えては降ろせないため。"""
+    return max(0, volume_l) // COMPARTMENT_UNIT_L * COMPARTMENT_UNIT_L
+
+
+def compartment_units(volume_by_product: dict) -> tuple[int, int]:
+    """降ろす量を槽で数える。(2kL単位の数, そのうち4kL槽に回せる組の数)。
+
+    油種ごとに、2kL単位で u 単位なら 4kL槽は最大 u//2 本使える（残りは2kL槽）。
+    1便に積めるかは fits_compartments で判定する。
+    """
+    units = pairs = 0
+    for v in volume_by_product.values():
+        if v <= 0:
+            continue
+        u = v // COMPARTMENT_UNIT_L
+        units += u
+        pairs += u // 2
+    return units, pairs
+
+
+def fits_compartments(compartments_l: tuple[int, ...], units: int, pairs: int, flex: int = 0) -> bool:
+    """1便ぶんの荷（槽で数えた units, pairs, flex）が、この車の槽に積めるか。
+
+    **槽は満量で積む**ので、2kL単位が奇数の荷は2kL槽を1本は使う。4kL槽に回せる
+    ぶんを4kL槽に詰め（最大 min(4kL槽の数, pairs) 組）、残りを2kL槽で持つ。
+    **欠品の直前の端数（flex）だけは緊急で、余った4kL槽に2kLだけ積んでよい**:
+
+        zp = min(4kL槽, pairs)、 a = min(flex, 4kL槽 − zp)
+        units − 2·zp − a ≦ 2kL槽の数
+
+    この詰め方（4kL槽を組に先に使う）で積めなければ、どう詰めても積めない。
+    合計容量だけを見ると、4kL槽×4の単車に2kLずつ3油種を積める計画が出る。
+    """
+    n4 = sum(1 for c in compartments_l if c == 4_000)
+    n2 = sum(1 for c in compartments_l if c == 2_000)
+    zp = min(n4, pairs)
+    a = min(flex, n4 - zp)
+    return units - 2 * zp - a <= n2
+
 #: 荷卸しの準備と手仕舞（着車・アース・ホース接続・検尺・伝票・収納）。
 #:
 #: 流下そのものとは別にかかる時間。流量の実測と、運送会社が1か所あたりに
@@ -179,6 +227,25 @@ class Product(str, Enum):
     GASOIL = "gasoil"        # 軽油
     REGULAR = "regular"      # レギュラーガソリン
     PREMIUM = "premium"      # ハイオクガソリン
+
+
+#: 1回に降ろす量の刻み（油種ごと）。**需要の多いレギュラー・軽油・灯油を2kL槽で
+#: 運ぶことはない**（実務・2026-09-16）。4kL槽の単位で運ぶ。ハイオクは売れる量が
+#: 少ないので2kLもある（仮置）。刻みに満たない端数は次の配送へ持ち越してまとめる。
+#:
+#: **例外は欠品の直前だけ。** SSが切れる緊急時は4kL槽に2kLだけ積むこともある（実務）。
+DROP_STEP_BY_PRODUCT: dict[Product, int] = {
+    Product.REGULAR: 4_000,
+    Product.GASOIL: 4_000,
+    Product.KEROSENE: 4_000,
+    Product.PREMIUM: 2_000,
+}
+
+
+def whole_drops_l(product: Product, volume_l: int) -> int:
+    """その油種の刻み（主要3油種は4kL、ハイオクは2kL）に切り捨てる。"""
+    step = DROP_STEP_BY_PRODUCT[product]
+    return max(0, volume_l) // step * step
 
 
 #: 画面と説明文で使う現場語。OR の用語も英語も配車係には出さない。
@@ -364,6 +431,10 @@ class Customer:
     #: その日でなければ空。
     planned: tuple[tuple["Product", int], ...] = ()
 
+    #: 明日の計画配送（油種, L）。明日がその日でなければ空。**今日は運ばない。**
+    #: 小口の発注が入ったら、これを前倒しして合わせ、当日1回で運ぶ（実務）。
+    tomorrow_planned: tuple[tuple["Product", int], ...] = ()
+
     #: 今日営業しているか。日曜休業のSSは日曜に受けられない（無人荷卸しが
     #: 無い前提）。見送り（accepts_delivery）とは別物で、警告の対象にしない。
     open_today: bool = True
@@ -429,7 +500,8 @@ class Customer:
             return None
         if self.demand_l <= 0:
             return None
-        if any(t.stockout_before_next_delivery and t.topup_l > 0 for t in self.tanks):
+        if any(t.stockout_before_next_delivery and whole_compartments_l(t.topup_l) > 0
+               for t in self.tanks):
             return "stockout"
         if self.orders:
             return "order"
@@ -458,6 +530,11 @@ class Customer:
 
         同じ油種に計画と発注が重なったら大きいほう（タンクは1本なので、
         足しても空き容量を超えては入らない）。
+
+        **量は槽の単位に切り捨てる。** 積込は2kL・4kL槽の単位で、槽の全量が入らなければ
+        その槽は降ろさない（実務）。需要の多いレギュラー・軽油・灯油は4kL槽の単位
+        （DROP_STEP_BY_PRODUCT）。**欠品の直前だけは緊急**で、2kLの単位まで降ろす
+        （4kL槽に2kLだけ積むこともある。実務）。
         """
         if not self.accepts_delivery or not self.open_today:
             return {}
@@ -470,11 +547,31 @@ class Customer:
                 q = max(q, min(ordered[t.product], t.topup_l))
             if t.product in planned:
                 q = max(q, min(planned[t.product], t.topup_l))
+            q = whole_drops_l(t.product, q)
             if t.stockout_before_next_delivery:
-                q = t.topup_l
+                q = whole_compartments_l(t.topup_l)     # 緊急: 2kLの単位まで
             if q > 0:
                 out[t.product] = out.get(t.product, 0) + q
         return out
+
+    def load_units(self) -> tuple[int, int, int]:
+        """今日の荷を槽で数える。(2kL単位の数, 4kL槽に回せる組の数, 緊急で4kL槽に入れてよい端数)。
+
+        欠品の直前のタンクの端数（2kL）は、緊急なので4kL槽に2kLだけ積んでよい（実務）。
+        それ以外の端数は2kL槽が要る。1便に積めるかは fits_compartments で判定する。
+        """
+        units = pairs = flex = 0
+        demand = self.demand_by_product()
+        for t in self.tanks:
+            v = demand.get(t.product, 0)
+            if v <= 0:
+                continue
+            u = v // COMPARTMENT_UNIT_L
+            units += u
+            pairs += u // 2
+            if u % 2 and t.stockout_before_next_delivery:
+                flex += 1
+        return units, pairs, flex
 
     def min_days_to_empty(self) -> float:
         """一番早く切れるタンクが何日もつか。切迫度の並べ替えに使う。"""
@@ -551,6 +648,13 @@ class Vehicle:
             raise ValueError(
                 f"{self.id}: 槽は {'/'.join(f'{c // 1000}kL' for c in COMPARTMENT_SIZES_L)}"
                 f" の組合せだけ。{odd} の槽は無い"
+            )
+        if set(self.compartments_l) != set(COMPARTMENT_SIZES_L):
+            # 全部2kL槽・全部4kL槽のローリーは存在しない（実務・2026-09-16）。
+            # 4/4/4/4 の車は2kLの荷を1つも積めず、実在しない制約で計画を縛っていた
+            raise ValueError(
+                f"{self.id}: 2kL槽と4kL槽の両方を持つ（全部同じ大きさの槽の車は無い）。"
+                f"{'/'.join(str(c // 1000) for c in self.compartments_l)} は不可"
             )
         allowed = CAPACITIES_L[self.vehicle_class]
         total = sum(self.compartments_l)

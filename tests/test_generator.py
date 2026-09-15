@@ -163,13 +163,21 @@ def test_unknown_declined_customer_is_rejected():
 
 
 def test_order_is_capped_by_ullage():
-    """発注量が空き容量を超えていたら、入りきる分だけ降ろす。"""
+    """発注量が空き容量を超えていたら、入りきる分だけ降ろす。**槽の単位で。**
+
+    槽の全量が入らなければその槽は降ろさない。需要の多い油種は4kL槽の単位なので、
+    空き6.7kLなら4kL（実務）。
+    """
     from dataclasses import replace
+
+    from core.domain import DROP_STEP_BY_PRODUCT, whole_drops_l
 
     c = next(x for x in generate(seed=20261015).customers if x.ordering)
     t = c.tanks[0]
     big = replace(c, orders=((t.product, t.capacity_l * 10),))
-    assert big.demand_by_product()[t.product] == t.topup_l
+    got = big.demand_by_product().get(t.product, 0)
+    assert got == whole_drops_l(t.product, t.topup_l)
+    assert got % DROP_STEP_BY_PRODUCT[t.product] == 0
 
 
 def test_stockout_forces_a_visit_even_without_an_order():
@@ -186,7 +194,9 @@ def test_stockout_forces_a_visit_even_without_an_order():
     c2 = replace(c, orders=(), tanks=(dry,) + c.tanks[1:])
     assert dry.stockout_before_next_delivery
     assert c2.is_mandatory and c2.mandatory_basis == "stockout"
-    assert c2.demand_by_product()[t.product] == dry.topup_l
+    from core.domain import whole_compartments_l
+
+    assert c2.demand_by_product()[t.product] == whole_compartments_l(dry.topup_l)
 
 
 def test_absent_driver_removes_vehicle():
@@ -259,8 +269,10 @@ def test_planned_volume_is_steady_monday_to_saturday():
         s = generate(seed=2000 + k, date=d.isoformat(), season="winter")
         planned.append(sum(c.demand_l for c in s.customers if c.planned))
     cv = statistics.pstdev(planned) / statistics.mean(planned)
-    # 名簿が15軒と小さいので、周期の起点の割り付けで±1〜2割の凸凹は残る
-    assert cv < 0.20, cv
+    # 名簿が15軒と小さいので、周期の起点の割り付けで±1〜2割の凸凹は残る。
+    # さらに主要3油種は4kL槽の単位で運び、端数を次回へ持ち越すので、1軒ぶんの量が
+    # 回ごとに4kL揺れる（1日40kL前後に対して1割ぶん）。2026-09-16 に0.20→0.25
+    assert cv < 0.25, cv
 
 
 def test_closed_customers_get_nothing_on_sunday():
@@ -313,12 +325,83 @@ def test_unload_time_depends_on_volume():
     """
     from dataclasses import replace
 
-    c = next(x for x in generate(seed=20261015, season="winter").customers if x.open_today)
-    t = max(c.tanks, key=lambda t: t.topup_l)
+    c, t = next((x, t) for x in generate(seed=20261015, season="winter").customers
+                if x.open_today for t in x.tanks if t.topup_l >= 4_000)
     small = replace(c, orders=(), planned=((t.product, 2_000),))
-    large = replace(c, orders=(), planned=((t.product, min(12_000, t.topup_l)),))
+    large = replace(c, orders=(), planned=((t.product, min(12_000, t.topup_l) // 2_000 * 2_000),))
     assert small.demand_l < large.demand_l
     assert small.service_min < large.service_min
+
+
+def test_every_tank_holds_a_cycle_and_a_compartment():
+    """どのタンクも、どの季節でも「3日ぶん＋その油種の刻み」が空き容量に収まる。
+
+    積込は槽の単位（主要3油種は4kL）なので、3日ぶんが刻みに満たない端数は次の配送へ
+    持ち越され、そのぶんタンクは低いまま残る（最大で刻み1つぶん未満）。収まらない
+    タンクは周期のうちに空になる。4kLの灯油タンク（冬に1日0.9kL）がそうだった。
+    """
+    from core.domain import DROP_STEP_BY_PRODUCT
+    from core.generator import PLANNED_INTERVAL_DAYS, PROFILES, SEASON_MULTIPLIER, ULLAGE_RATIO
+
+    for typ, prof in PROFILES.items():
+        for p, (cap, base) in prof.tanks.items():
+            usable = cap - round(cap * ULLAGE_RATIO)
+            for season, mult in SEASON_MULTIPLIER.items():
+                need = round(base * mult[p]) * PLANNED_INTERVAL_DAYS + DROP_STEP_BY_PRODUCT[p]
+                assert need <= usable, (typ, p, season, need, usable)
+
+
+def test_planned_quantities_are_whole_compartments_and_match_sales_over_time():
+    """計画配送の量は毎回2kLの倍数で、端数を持ち越すので長い目では売れる量と等しい。"""
+    import datetime
+
+    from core.generator import PLANNED_INTERVAL_DAYS, _planned_daily
+
+    delivered: dict = {}
+    days = 0
+    start = datetime.date(2026, 10, 12)
+    for k in range(60):
+        d = (start + datetime.timedelta(days=k)).isoformat()
+        c = next(x for x in generate(seed=1, date=d, season="winter").customers if x.id == "c02")
+        for p, v in c.planned:
+            from core.domain import DROP_STEP_BY_PRODUCT
+
+            assert v % DROP_STEP_BY_PRODUCT[p] == 0, (d, p, v)
+            delivered[p] = delivered.get(p, 0) + v
+        days += 1
+    from core.generator import ROSTER
+
+    spec = next(s for s in ROSTER if s.id == "c02")
+    for p, daily in _planned_daily(spec, "winter").items():
+        # 60日で20回。端数の持ち越しは最大で刻み1つぶん未満
+        assert abs(delivered.get(p, 0) - daily * days) <= 4_000 + daily * PLANNED_INTERVAL_DAYS, (p,)
+
+
+def test_no_lorry_has_only_one_size_of_compartment():
+    """全部2kL槽・全部4kL槽のローリーは存在しない（実務）。"""
+    from core.domain import Vehicle, VehicleClass
+
+    for v in generate(seed=1).vehicles:
+        assert set(v.compartments_l) == {2_000, 4_000}, (v.id, v.compartments_l)
+    with pytest.raises(ValueError, match="両方を持つ"):
+        Vehicle(id="bad", name="4kL槽だけ", vehicle_class=VehicleClass.RIGID,
+                compartments_l=(4_000, 4_000, 4_000, 4_000), driver_id="d1")
+
+
+def test_heavy_products_come_in_4kl_compartments():
+    """レギュラー・軽油・灯油を2kL槽で運ぶことはない（実務）。欠品の直前だけは緊急で例外。"""
+    import datetime
+
+    from core.domain import Product
+
+    heavy = (Product.REGULAR, Product.GASOIL, Product.KEROSENE)
+    for k in range(14):
+        d = (datetime.date(2026, 10, 12) + datetime.timedelta(days=k)).isoformat()
+        for c in generate(seed=500 + k, date=d, season="winter").customers:
+            stockout = {t.product for t in c.tanks if t.stockout_before_next_delivery}
+            for p, v in c.demand_by_product().items():
+                if p in heavy and p not in stockout:
+                    assert v % 4_000 == 0, (d, c.id, p, v)
 
 
 def test_compartments_obey_hazmat_law():

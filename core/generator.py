@@ -34,6 +34,7 @@ import random
 from dataclasses import dataclass
 
 from core.domain import (
+    DROP_STEP_BY_PRODUCT,
     Customer,
     CustomerType,
     Depot,
@@ -46,6 +47,7 @@ from core.domain import (
     VehicleClass,
     hhmm_to_minutes,
     unload_minutes,
+    whole_drops_l,
 )
 from core.events import SoldMore, sell_more, validate as validate_events
 from core.travel import leg_minutes
@@ -155,42 +157,46 @@ class TypeProfile:
     tanks: dict[Product, tuple[int, int]]
 
 
-#: 類型ごとのタンク構成。数字は国内のGS地下タンクの実勢に寄せてある。
+#: 類型ごとのタンク構成。
 #:
-#: **1サイト合計 20〜40kL** が目安。ここを大きく取りすぎると、1軒の補給で
-#: ローリー1台を使い切る計画になり、車が何台あっても足りなくなる。
-#: 消費量は「満タンから約10日で使い切る」水準に置いてあり、発注点（容量の
-#: 25〜35%）まで約7日。2日先読み（DELIVERY_LOOKAHEAD_DAYS）で拾うと、
-#: 15軒のうち日に5〜8軒が対象になる。これが二次配送の実際の頻度に近い。
+#: **SSの地下タンクはほとんど30kL、古いところでも10kL。それを油種ごとに分割して
+#: 使っている**（実務・2026-09-16）。以下は30kLを分けた形（古い郊外SSは10kL）で、
+#: どの類型にどう分けるかは仮置。以前は4〜15kLの架空の容量で、槽の単位
+#: （主要3油種は4kL）で運ぶと周期のうちに空になるタンクが出た。
+#:
+#: 容量を大きくしても運ぶ量は膨らまない。計画配送の量は売れる量（周期）で決まる
+#: （以前は「満タンまで」で需要を作っていたので、容量が需要を膨らませていた）。
 PROFILES: dict[CustomerType, TypeProfile] = {
     CustomerType.URBAN_GS_24H: TypeProfile(
         window_open="05:00",
         window_close="21:00",
         tanks={
-            Product.REGULAR: (15_000, 1_700),
-            Product.PREMIUM: (5_000, 420),
-            Product.GASOIL: (8_000, 800),
-            Product.KEROSENE: (4_000, 350),
+            # 30kL を レギュラー20／ハイオク10、もう1本を 軽油20／灯油10
+            Product.REGULAR: (20_000, 1_700),
+            Product.PREMIUM: (10_000, 420),
+            Product.GASOIL: (20_000, 800),
+            Product.KEROSENE: (10_000, 350),
         },
     ),
     CustomerType.URBAN_GS_DAY: TypeProfile(
         window_open="08:00",
         window_close="17:00",
         tanks={
-            Product.REGULAR: (12_000, 1_300),
-            Product.PREMIUM: (4_000, 320),
-            Product.GASOIL: (6_000, 600),
-            Product.KEROSENE: (4_000, 350),
+            # 30kL を レギュラー20／ハイオク10、軽油・灯油は古い10kL
+            Product.REGULAR: (20_000, 1_300),
+            Product.PREMIUM: (10_000, 320),
+            Product.GASOIL: (10_000, 600),
+            Product.KEROSENE: (10_000, 350),
         },
     ),
     CustomerType.SANIN_GS: TypeProfile(
         window_open="07:00",
         window_close="18:00",
         tanks={
-            Product.REGULAR: (12_000, 1_200),
+            # 山陰側は冬の灯油が主役。灯油に30kLを1本、もう1本を レギュラー20／軽油10
+            Product.REGULAR: (20_000, 1_200),
             Product.GASOIL: (10_000, 1_000),
-            # 山陰側は冬の灯油が主役。タンクも大きい。
-            Product.KEROSENE: (20_000, 900),
+            Product.KEROSENE: (30_000, 900),
         },
     ),
     CustomerType.CARRIER_DEPOT: TypeProfile(
@@ -205,10 +211,11 @@ PROFILES: dict[CustomerType, TypeProfile] = {
         window_open="07:00",
         window_close="19:00",
         tanks={
-            Product.REGULAR: (8_000, 750),
-            Product.GASOIL: (6_000, 550),
-            # 郊外は灯油比率が高いのにタンクが小さい → 発注点割れが頻発する
-            Product.KEROSENE: (8_000, 620),
+            # 古い郊外SS。10kLのタンクを油種ごとに1本ずつ
+            Product.REGULAR: (10_000, 750),
+            Product.GASOIL: (10_000, 550),
+            # 郊外は灯油比率が高いのにタンクが小さい → 発注点割れが起きやすい
+            Product.KEROSENE: (10_000, 620),
         },
     ),
 }
@@ -238,6 +245,9 @@ HOSE_INCH = 3
 #: SSの月間売上はある程度一定で、たとえば月100kL売る先は稼働25日で
 #: 1日4kL、それを3日に1回まとめて運ぶ（1回12kL前後）。名簿の冬の消費量
 #: では、どの先のどのタンクも3日ぶんが空き容量に収まる（3.1日以上もつ）。
+#:
+#: **槽の単位で運ぶので、3日ぶん＋2kL（槽1本ぶんの持ち越し）が収まる必要がある。**
+#: 収まらないタンクは周期のうちに空になる（test_every_tank_holds_a_cycle_and_a_compartment）。
 PLANNED_INTERVAL_DAYS = 3
 
 #: 日々の消費の揺れ（計画量に対する標準偏差の比）。**仮置。**
@@ -313,7 +323,9 @@ FLEET: tuple[tuple[str, str, VehicleClass, tuple[int, ...]], ...] = (
     ("v1", "1号車", VehicleClass.TRAILER, (2_000, 4_000, 4_000, 2_000, 4_000, 4_000, 4_000)),  # 24kL 7槽
     ("v2", "2号車", VehicleClass.TRAILER, (2_000, 4_000, 4_000, 2_000, 4_000, 4_000)),         # 20kL 6槽
     ("v3", "3号車", VehicleClass.TRAILER, (2_000, 4_000, 4_000, 2_000, 4_000, 2_000)),         # 18kL 6槽
-    ("v4", "4号車", VehicleClass.RIGID, (4_000, 4_000, 4_000, 4_000)),                         # 16kL 4槽
+    # 全部4kL槽（や全部2kL槽）のローリーは存在しない（実務・2026-09-16）。以前は
+    # 4/4/4/4 を置いていて、2kLの荷を1つも積めない車になっていた。仮置で 2/4/4/2/4
+    ("v4", "4号車", VehicleClass.RIGID, (2_000, 4_000, 4_000, 2_000, 4_000)),                  # 16kL 5槽
     ("v5", "5号車", VehicleClass.RIGID, (2_000, 4_000, 4_000, 4_000)),                         # 14kL 4槽
 )
 
@@ -350,13 +362,27 @@ def _planned_daily(spec: CustomerSpec, season: str) -> dict[Product, int]:
     }
 
 
+def _planned_drop(spec: CustomerSpec, season: str) -> tuple[tuple[Product, int], ...]:
+    """計画配送1回で運ぶ量の**平均的な姿**（油種ごと）。曜日を均す重さにだけ使う。
+
+    実際の日ごとの量は端数の持ち越しで揺れる（_planned_drop_on）。ここでは
+    3日ぶんの見込みを、その油種の刻み（主要3油種4kL・ハイオク2kL）に丸める。
+    """
+    out = []
+    for p, v in _planned_daily(spec, season).items():
+        step = DROP_STEP_BY_PRODUCT[p]
+        q = int(v * PLANNED_INTERVAL_DAYS / step + 0.5) * step
+        if q > 0:
+            out.append((p, q))
+    return tuple(out)
+
+
 def _work_minutes(spec: CustomerSpec, season: str) -> int:
     """計画配送1回が車の時間をどれだけ食うか（分）。
 
     油槽所との往復 ＋ 荷卸し ＋ 積込。**曜日を均すときの重さはこれ。**
     """
-    daily = _planned_daily(spec, season)
-    drop = {p: v * PLANNED_INTERVAL_DAYS for p, v in daily.items() if v > 0}
+    drop = dict(_planned_drop(spec, season))
     one_way = leg_minutes(MARIFU.lat, MARIFU.lon, spec.lat, spec.lon)
     unload = unload_minutes(drop, min(HOSE_INCH, spec.piping_inch))
     return 2 * one_way + unload + MARIFU.load_min
@@ -409,8 +435,34 @@ def _operating_day(n: int, closed_sunday: bool) -> tuple[int, bool]:
     return n - sundays, True
 
 
+def _carried(product: Product, daily_l: int, deliveries: int) -> int:
+    """deliveries 回の計画配送を終えた時点で、**刻みに満たず運びきれていない量**（L）。
+
+    積込は槽の単位で、需要の多い油種は4kL槽の単位（実務）なので、3日ぶん5.7kLは
+    毎回そのまま運べない。毎回切り捨てると端数が消え、運ぶ量が売れる量の55%まで
+    落ちた（2026-09-16）。実際は端数ぶんタンクが低いまま残り、次の配送でまとめて
+    運ぶ。周期の番号から決まるので乱数は使わず、同じ日付なら同じ量になる。
+    """
+    return daily_l * PLANNED_INTERVAL_DAYS * deliveries % DROP_STEP_BY_PRODUCT[product]
+
+
+def _planned_drop_on(spec: CustomerSpec, season: str, k: int) -> tuple[tuple[Product, int], ...]:
+    """k 回目の計画配送で運ぶ量。**3日ぶんに前回までの端数を足し、刻みに切り捨てる。**
+
+    長い目で見れば運ぶ量は売れる量と等しい（毎回の量は4kL・8kL・4kL…と揺れる）。
+    刻みに満たない油種はその回は運ばず、次の回にまとめる（ハイオクなど）。
+    """
+    out = []
+    for p, d in _planned_daily(spec, season).items():
+        q = whole_drops_l(p, d * PLANNED_INTERVAL_DAYS + _carried(p, d, k - 1))
+        if q > 0:
+            out.append((p, q))
+    return tuple(out)
+
+
 def _cycle_tanks(
-    rng: random.Random, spec: CustomerSpec, season: str, days_since: int
+    rng: random.Random, spec: CustomerSpec, season: str, days_since: int,
+    carried: dict[Product, int] | None = None,
 ) -> tuple[Tank, ...]:
     """計画配送の先のタンク。**在庫は周期から決まる。**
 
@@ -418,10 +470,14 @@ def _cycle_tanks(
     days_since 営業日ぶん売れた、とする。以前は在庫を三角分布の乱数で
     振っていたが、それだと計画配送の量まで日によってばらつき、「月〜土は
     ほぼ一定量」という実態から外れていた。揺れは消費の日々の揺れだけ。
+
+    carried は前回までに**槽の単位に満たず運びきれなかった量**。そのぶん
+    タンクは満タンより低い（_carried）。
     """
     profile = PROFILES[spec.type]
     daily = _planned_daily(spec, season)
     reorder_ratio = REORDER_RATIO[spec.type]
+    carried = carried or {}
     tanks = []
     for product, (capacity, _base) in profile.tanks.items():
         ullage = int(round(capacity * ULLAGE_RATIO))
@@ -431,7 +487,7 @@ def _cycle_tanks(
             Tank(
                 product=product,
                 capacity_l=capacity,
-                level_l=max(0, capacity - ullage - sold),
+                level_l=max(0, capacity - ullage - carried.get(product, 0) - sold),
                 reorder_l=int(round(capacity * reorder_ratio)),
                 daily_use_l=daily[product],
                 ullage_margin_l=ullage,
@@ -500,6 +556,7 @@ def generate(
         profile = PROFILES[spec.type]
         op, open_today = _operating_day(n, CLOSED_ON_SUNDAY[spec.type])
         planned: tuple[tuple[Product, int], ...] = ()
+        tomorrow_planned: tuple[tuple[Product, int], ...] = ()
         if spec.ordering:
             # 発注配送の先: 自分の在庫を見て不定期に頼む。**計画配送の一定量の
             # 上に乗る、振れる部分**にあたる。
@@ -513,10 +570,16 @@ def generate(
             # 1日2.2kLしか使わない営業所が毎日15kLずつ頼み、発注が計画配送より
             # 大きくなった。量が消費と釣り合わない在庫の作り方は使えない。
             days_since = rng.randint(1, PLANNED_INTERVAL_DAYS)
-            tanks = sell_more(_cycle_tanks(rng, spec, season, days_since),
+            # 前回までの端数は周期の番号を持たないので、刻み未満を別の乱数で振る
+            # （主の乱数の流れは変えない）。平均すれば頼む量は売れる量と釣り合う。
+            side = random.Random(f"{seed}|{date}|{spec.id}")
+            carried = {p: side.randrange(DROP_STEP_BY_PRODUCT[p]) for p in PROFILES[spec.type].tanks}
+            tanks = sell_more(_cycle_tanks(rng, spec, season, days_since, carried),
                               events_by_customer.get(spec.id, ()))
+            # 頼む量も刻みの単位（主要3油種は4kL槽）
             orders = (
-                tuple((t.product, t.topup_l) for t in tanks if t.topup_l > 0)
+                tuple((t.product, whole_drops_l(t.product, t.topup_l)) for t in tanks
+                      if whole_drops_l(t.product, t.topup_l) > 0)
                 if open_today and days_since == PLANNED_INTERVAL_DAYS else ()
             )
         else:
@@ -526,17 +589,25 @@ def generate(
             phase = phases[spec.id]
             days_since = ((op - phase - 1) % PLANNED_INTERVAL_DAYS) + 1
             due = open_today and (op - phase) % PLANNED_INTERVAL_DAYS == 0
-            tanks = sell_more(_cycle_tanks(rng, spec, season, days_since),
+            # 直近に済んだ配送の番号。計画配送の日はその朝はまだ運んでいない
+            k = (op - phase) // PLANNED_INTERVAL_DAYS
+            done = k - 1 if (op - phase) % PLANNED_INTERVAL_DAYS == 0 else k
+            daily = _planned_daily(spec, season)
+            carried = {p: _carried(p, d, done) for p, d in daily.items()}
+            tanks = sell_more(_cycle_tanks(rng, spec, season, days_since, carried),
                               events_by_customer.get(spec.id, ()))
             if due:
-                daily = _planned_daily(spec, season)
-                planned = tuple(
-                    (p, daily[p] * PLANNED_INTERVAL_DAYS) for p in daily if daily[p] > 0
-                )
+                planned = _planned_drop_on(spec, season, k)
             orders = (
-                tuple((t.product, t.topup_l) for t in tanks if t.is_below_reorder)
+                tuple((t.product, whole_drops_l(t.product, t.topup_l)) for t in tanks
+                      if t.is_below_reorder and whole_drops_l(t.product, t.topup_l) > 0)
                 if open_today and not due else ()
             )
+            # 明日が計画配送の日なら、その量。**小口の発注は翌日の計画配送を前倒しして
+            # 合わせ、当日1回で運ぶ**（実務）ので、組み直しがこれを使う。
+            op1, open1 = _operating_day(n + 1, CLOSED_ON_SUNDAY[spec.type])
+            if open1 and op1 != op and (op1 - phase) % PLANNED_INTERVAL_DAYS == 0:
+                tomorrow_planned = _planned_drop_on(spec, season, (op1 - phase) // PLANNED_INTERVAL_DAYS)
         customers.append(
             Customer(
                 id=spec.id,
@@ -555,6 +626,7 @@ def generate(
                 ordering=spec.ordering,
                 orders=orders,
                 planned=planned,
+                tomorrow_planned=tomorrow_planned,
                 open_today=open_today,
                 accepts_delivery=spec.id not in declined_customers,
             )
