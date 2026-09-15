@@ -40,6 +40,7 @@ from dataclasses import dataclass, replace
 
 from core.domain import (
     COMPARTMENT_UNIT_L,
+    DROP_STEP_BY_PRODUCT,
     Customer,
     Driver,
     Product,
@@ -47,7 +48,7 @@ from core.domain import (
     Vehicle,
     VehicleClass,
     minutes_to_hhmm,
-    whole_compartments_l,
+    whole_drops_l,
 )
 from core.events import SoldMore, sell_more, validate as validate_events
 from core.solver import Plan, SolveMode, Trip, Unserved, VehicleDay, solve
@@ -62,6 +63,10 @@ REPLAN_MAX_TRIPS = 3
 #: これより少ない量のためには車を出さない（いちばん小さい槽＝2kL）。
 #: 発注量どおりに入らず、入る量がこれに満たないときは、SSに確認してからにする。
 MIN_DROP_L = COMPARTMENT_UNIT_L
+
+#: 小口の発注とみなす量（1軒ぶんの合計）。**仮置。** 実務: 特殊な油種でなければ
+#: 2kL・4kLの発注はあり得ず、小口の発注は翌日の計画配送を前倒しして合わせて運ぶ。
+SMALL_ORDER_MAX_L = 4_000
 
 #: 発注として受け付ける経路。**証拠の残るものだけ。**（実務）
 ORDER_SOURCES = ("system", "fax")
@@ -245,6 +250,7 @@ def replan(
                 frozen_visit[st.customer_id] = (vd.vehicle_name.split("（")[0], st.arrive_min, st.delivered_l)
 
     customers: list[Customer] = []
+    pulled: dict[str, tuple[tuple[Product, int], ...]] = {}
     shortfalls: list[str] = []
     deliverable: dict[tuple[str, Product], int] = {}
     for c in scenario.customers:
@@ -272,14 +278,26 @@ def replan(
             # これで、8kLの発注に0.8kLを運ぶために1台出していた）。
             merged = dict(c2.orders)
             room = {t.product: t.topup_l for t in c2.tanks}
-            for p, v in new_by_customer[c.id].items():
+            new = dict(new_by_customer[c.id])
+            # **小口の発注は、翌日の計画配送を前倒しして合わせ、当日1回で運ぶ**（実務）。
+            # 需要の多い油種は4kL槽の単位でしか運ばないので、2kLの発注だけでは車に積めない
+            want = dict(new)
+            if (sum(new.values()) <= SMALL_ORDER_MAX_L and c.tomorrow_planned
+                    and c.id not in served_frozen):
+                for p, v in c.tomorrow_planned:
+                    want[p] = want.get(p, 0) + v
+                pulled[c.id] = tuple(c.tomorrow_planned)
+            for p, v in want.items():
+                ordered_v = new.get(p, 0)
                 fits = max(0, room.get(p, 0) - merged.get(p, 0))
-                # **槽の単位（2kLの倍数）でしか積めない**（実務）。空きが3.7kLなら2kL、
-                # 2kLに満たなければ車は出さない
-                take = whole_compartments_l(min(v, fits))
-                if take < v:
-                    if v % MIN_DROP_L and fits >= v:
-                        why = f"積込は2kL・4kL槽の単位（発注量が槽の単位になっていない）"
+                # **槽の単位でしか積めない**（実務）。主要3油種は4kL、ハイオクは2kL。
+                # 刻みに満たなければ車は出さない
+                take = whole_drops_l(p, min(v, fits))
+                if take < ordered_v:
+                    step = DROP_STEP_BY_PRODUCT[p]
+                    if ordered_v % step and fits >= ordered_v:
+                        why = (f"{PRODUCT_JA[p]}は{step // 1000}kL槽の単位で運ぶ"
+                               "（明日が計画配送の日でないので、合わせて運べない）")
                     else:
                         why = f"タンクの空きが {fits / 1000:.1f}kL しかない"
                     if c.id in frozen_visit:
@@ -287,10 +305,10 @@ def replan(
                         why += f"（{minutes_to_hhmm(at)} に{vname}が {vol / 1000:.1f}kL 降ろす便が積込済み）"
                     what = (
                         f"入るのは {take / 1000:.1f}kL" if take
-                        else f"入る量が {MIN_DROP_L / 1000:.0f}kL に満たないので車は出さない"
+                        else f"入る量が {DROP_STEP_BY_PRODUCT[p] / 1000:.0f}kL に満たないので車は出さない"
                     )
                     shortfalls.append(
-                        f"{c.name} {PRODUCT_JA[p]}: 発注 {v / 1000:.1f}kL のうち{what}。"
+                        f"{c.name} {PRODUCT_JA[p]}: 発注 {ordered_v / 1000:.1f}kL のうち{what}。"
                         f"{why}。**SSに確認が要る**"
                     )
                 deliverable[(c.id, p)] = deliverable.get((c.id, p), 0) + take
@@ -334,7 +352,8 @@ def replan(
                 id=f"s{k + 1}",
                 name=f"非専属{k + 1}（単車 16kL）",
                 vehicle_class=VehicleClass.RIGID,
-                compartments_l=(4_000, 4_000, 4_000, 4_000),
+                # 全部4kL槽の車は存在しない（実務）。4号車と同じ 2/4/4/2/4（仮置）
+                compartments_l=(2_000, 4_000, 4_000, 2_000, 4_000),
                 driver_id=did,
                 spot=True,
                 available_from_min=now_min + SPOT_LEAD_MIN,
@@ -439,6 +458,15 @@ def replan(
             changes.append(f"{label}: {names[vid]}の{trip + 1}便目で {minutes_to_hhmm(arrive)} 着")
         else:
             changes.append(f"{label}: **今日中に入りません**")
+    for cid, plan_items in pulled.items():
+        what = "・".join(
+            f"{PRODUCT_JA[p]} {deliverable.get((cid, p), 0) / 1000:.0f}kL"
+            for p, _ in plan_items if deliverable.get((cid, p), 0) > 0
+        )
+        if what:
+            changes.append(
+                f"{by_id[cid].name}: 小口の発注なので、明日の計画配送を前倒しして合わせて運ぶ（{what}）"
+            )
 
     spot_ids = {v.id for v in vehicles if v.spot}
     spot_called = tuple(vd.vehicle_id for vd in sub_plan.vehicle_days if vd.vehicle_id in spot_ids)

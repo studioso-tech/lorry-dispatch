@@ -22,8 +22,6 @@ from core.travel import build_matrix
 
 DATE = "2026-10-16"
 NOW = 9 * 60 + 12        # FAX の受信時刻
-FAX = [NewOrder("c02", Product.REGULAR, 4_000, "fax", "FAX:test"),
-       NewOrder("c02", Product.KEROSENE, 2_000, "fax", "FAX:test")]
 
 
 def _customer(s, cid):
@@ -115,41 +113,110 @@ def test_cli_notation():
 # --- 組み直し（日中に分かった）＝デモの幕2〜3 --------------------------------
 
 
-def test_without_the_event_the_fax_order_has_nowhere_to_go():
-    """見込みのままでは空きが無く、4kLの発注に車を出せない（下見で見つけた姿）。"""
+def _target():
+    """朝の計画に無い市内SS（当日発注の相手）。前提はデータ任せにせず、ここで組み立てる。"""
     s, base = _morning()
-    r = replan(s, base, now_min=NOW, orders=FAX, time_limit_s=30)
-    assert len(r.shortfalls) == 2
-    assert not any("宇品港" in c for c in r.changes)
+    served = {st.customer_id for t in base.trips for st in t.stops}
+    c = next(_customer(s, cid) for cid in ("c02", "c01", "c03", "c05", "c04")
+             if cid not in served and _customer(s, cid).open_today)
+    return s, base, c
+
+
+def _over_room(c, product):
+    """空きより4kL槽1本ぶん多い発注（8kL以上＝小口ではない）と、それが入るのに要る「売れた日数」。"""
+    from core.domain import whole_drops_l
+
+    t = next(t for t in c.tanks if t.product is product)
+    vol = max(8_000, whole_drops_l(product, t.topup_l) + 4_000)
+    days = round((vol - t.topup_l) / t.daily_use_l + 0.5, 1)
+    return vol, days
+
+
+def _order(c, product, vol):
+    return NewOrder(c.id, product, vol, "fax", "FAX:test")
+
+
+def test_without_the_event_the_order_has_nowhere_to_go():
+    """見込みのままでは空きが足りず、発注どおりには入らない（下見で見つけた姿）。"""
+    s, base, c = _target()
+    vol, _days = _over_room(c, Product.REGULAR)
+    r = replan(s, base, now_min=NOW, orders=[_order(c, Product.REGULAR, vol)], time_limit_s=30)
+    assert len(r.shortfalls) == 1 and "空き" in r.shortfalls[0]
 
 
 def test_learning_that_the_station_sold_more_lets_the_order_land():
     """FAXの但し書き（連休で来客が多い）を事象として当てると、発注どおり入る。"""
-    s, base = _morning()
-    r = replan(s, base, now_min=NOW, orders=FAX, time_limit_s=30,
-               sold_more=(SoldMore("c02", 2.0),))
+    s, base, c = _target()
+    vol, days = _over_room(c, Product.REGULAR)
+    r = replan(s, base, now_min=NOW, orders=[_order(c, Product.REGULAR, vol)], time_limit_s=30,
+               sold_more=(SoldMore(c.id, days, Product.REGULAR),))
     assert r.ok and not r.shortfalls
-    assert sum("宇品港" in c for c in r.changes) == 2
+    assert any(c.name in x and "着" in x for x in r.changes)
 
 
 def test_a_holiday_rush_on_gasoline_does_not_make_room_for_kerosene():
     """連休で出るのはガソリン。灯油の空きは増えないので、灯油の発注はSSに確認を返す。"""
-    s, base = _morning()
-    r = replan(s, base, now_min=NOW, orders=FAX, time_limit_s=30,
-               sold_more=(SoldMore("c02", 2.0, Product.REGULAR),))
-    assert any("レギュラー 4.0kL" in c for c in r.changes)
+    s, base, c = _target()
+    vol_r, days = _over_room(c, Product.REGULAR)
+    vol_k, _ = _over_room(c, Product.KEROSENE)
+    r = replan(s, base, now_min=NOW, time_limit_s=30,
+               orders=[_order(c, Product.REGULAR, vol_r), _order(c, Product.KEROSENE, vol_k)],
+               sold_more=(SoldMore(c.id, days, Product.REGULAR),))
+    assert any(f"レギュラー {vol_r / 1000:.1f}kL" in x for x in r.changes)
     assert len(r.shortfalls) == 1 and "灯油" in r.shortfalls[0]
 
 
 def test_the_event_does_not_change_what_the_morning_trips_carried():
     """積込済みの便の先に事象を当てても、朝の車が積んだ量の差し引きは朝の見込みで行う。"""
-    s, base = _morning()
+    s, base, c = _target()
+    vol, _ = _over_room(c, Product.REGULAR)
+    orders = [_order(c, Product.REGULAR, vol)]
     frozen = next(st.customer_id for vd in base.vehicle_days for t in vd.trips
                   if t.load_start_min < NOW for st in t.stops)
-    plain = replan(s, base, now_min=NOW, orders=FAX, time_limit_s=30)
-    hot = replan(s, base, now_min=NOW, orders=FAX, time_limit_s=30,
+    plain = replan(s, base, now_min=NOW, orders=orders, time_limit_s=30)
+    hot = replan(s, base, now_min=NOW, orders=orders, time_limit_s=30,
                  sold_more=(SoldMore(frozen, 1.0),))
     assert [t for t in plain.frozen_trips] == [t for t in hot.frozen_trips]
+
+
+# --- 小口の発注（翌日の計画配送を前倒しして合わせる） --------------------------
+
+
+def _small_order_case():
+    """明日が計画配送の日で、朝の計画に無い先を探す。"""
+    import datetime
+
+    for k in range(7):
+        d = (datetime.date(2026, 10, 12) + datetime.timedelta(days=k)).isoformat()
+        s = generate(seed=20261015, date=d, season="winter")
+        base = solve(s, matrix=build_matrix(s.depot, s.customers), mode=SolveMode.FAST, time_limit_s=20)
+        served = {st.customer_id for t in base.trips for st in t.stops}
+        for c in s.customers:
+            if c.tomorrow_planned and c.id not in served and c.open_today and c.accepts_delivery:
+                return s, base, c
+    raise AssertionError("明日が計画配送の日で朝の計画に無い先が1週間に無い")
+
+
+def test_small_order_pulls_tomorrows_planned_delivery_forward():
+    """**小口の発注には、翌日の計画配送を組み合わせて当日に運ぶ**（実務）。
+
+    需要の多い油種は4kL槽の単位でしか運ばない。小口だけのために車を出すのではなく、
+    明日運ぶはずの計画配送を前倒しして、まとまった量にして運ぶ。
+    """
+    s, base, c = _small_order_case()
+    p, _ = c.tomorrow_planned[0]
+    r = replan(s, base, now_min=7 * 60, time_limit_s=30,
+               orders=[NewOrder(c.id, p, 4_000, "system", "ORD-SMALL")])
+    assert any("前倒し" in x and c.name in x for x in r.changes), r.changes
+
+
+def test_a_large_order_does_not_pull_tomorrow_forward():
+    s, base, c = _small_order_case()
+    p, _ = c.tomorrow_planned[0]
+    t = next(t for t in c.tanks if t.product is p)
+    r = replan(s, base, now_min=7 * 60, time_limit_s=30,
+               orders=[NewOrder(c.id, p, max(8_000, t.topup_l // 4_000 * 4_000), "system", "ORD-BIG")])
+    assert not any("前倒し" in x for x in r.changes)
 
 
 # --- API ----------------------------------------------------------------------
@@ -157,16 +224,18 @@ def test_the_event_does_not_change_what_the_morning_trips_carried():
 
 def test_replan_api_takes_the_event_learned_during_the_day():
     client = TestClient(app)
+    _s, _base, c = _target()
+    vol, days = _over_room(c, Product.REGULAR)
     r = client.post("/api/replan", json={
         "seed": 20261015, "date": DATE, "now": "09:12",
-        "orders": [{"customer_id": "c02", "product": "regular", "volume_l": 4000,
+        "orders": [{"customer_id": c.id, "product": "regular", "volume_l": vol,
                     "source": "fax", "evidence_ref": "FAX:test"}],
-        "sold_more_now": [{"customer_id": "c02", "extra_days": 2, "product": "regular"}],
+        "sold_more_now": [{"customer_id": c.id, "extra_days": days, "product": "regular"}],
     })
     assert r.status_code == 200, r.text
     body = r.json()
     assert body["sold_more_now"] and "レギュラー" in body["sold_more_now"][0]
-    assert any("宇品港" in c for c in body["changes"])
+    assert any(c.name in x for x in body["changes"])
     assert not body["shortfalls"]
 
 

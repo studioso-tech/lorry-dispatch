@@ -69,6 +69,13 @@ def test_a_bigger_compartment_can_stop_fitting_where_a_smaller_one_did():
     （実務）、槽が大きいほど近くでは捌けず、クッションへ回ることになる。
     """
     s, plan, e = _day()
+    # 近くの先の空きをどれも3kLにそろえる（データ任せにせず前提を組み立てる）
+    three = tuple(
+        c if c.id == e.customer_id else replace(
+            c, tanks=tuple(replace(t, level_l=t.capacity_l - t.ullage_margin_l - 3_000) for t in c.tanks))
+        for c in s.customers
+    )
+    s = replace(s, customers=three)
     small = handle_return(s, plan, replace(e, volume_l=2_000))
     big = handle_return(s, plan, replace(e, volume_l=4_000))
     assert small.chosen.kind == "redeliver"

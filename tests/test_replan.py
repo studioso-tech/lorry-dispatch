@@ -35,7 +35,9 @@ def _base(seed: int, date: str, fleet: tuple[str, ...]):
 def _surge(s, base, n=4):
     """朝の計画に無い先から、当日発注を n 件（連休の高速SSのような重なり）。"""
     served = {st.customer_id for t in base.trips for st in t.stops}
-    free = [c for c in s.customers if c.id not in served and c.open_today and c.accepts_delivery]
+    # 午前で受入を締める先（営業所は8:30まで）は、8時の組み直しではどの車も間に合わない
+    free = [c for c in s.customers if c.id not in served and c.open_today and c.accepts_delivery
+            and c.window_close_min >= 15 * 60]
     orders = []
     for c in free:
         t = max(c.tanks, key=lambda t: t.topup_l)
