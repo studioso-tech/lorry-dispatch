@@ -60,7 +60,10 @@ MAX_FLEET = 12
 # v3: 積込 40分 → 20分（実務）、日勤は5:00に車庫を出る
 # v4: SSの規模を実務に寄せた（月150〜450kL）。1エリアの需要が約3倍になり、
 #     タンク・配送周期・分割配送が入った（2026-09-16）
-CACHE = Path(__file__).resolve().parents[1] / "data" / "carrier_cache_v4.json"
+# v5: **計画配送は在庫が切れない限り前後に動かせる**（実務・2026-09-16）。
+#     「その日の計画配送を全部運べるか」ではなく「欠品と発注に応えられるか」で
+#     必要台数を数える
+CACHE = Path(__file__).resolve().parents[1] / "data" / "carrier_cache_v5.json"
 
 #: 1人1日の拘束の上限（改善基準告示の原則13時間）。融通した場合の下限に使う。
 DUTY_CAP_MIN = 780
@@ -75,7 +78,11 @@ def _week(year: int, month: int) -> list[datetime.date]:
 
 
 def min_fleet(task: tuple[int, str, str, float]) -> tuple[str, int, bool, int]:
-    """1エリア・1日を、欠品ゼロで回る最小の台数で解く。
+    """1エリア・1日を、**欠品ゼロ・発注に応えられる**最小の台数で解く。
+
+    **計画配送は在庫が切れない限り前後に動かせる**（実務・2026-09-16）ので、
+    その日の計画配送を全部運びきれたかは問わない。運べなかった計画配送は翌日に
+    回る（翌日の在庫が切れるなら、その日に欠品として現れる）。
 
     Returns:
         (キャッシュのキー, 台数, 上限内で足りたか, 使った車の拘束時間の合計（分）)。
@@ -89,7 +96,9 @@ def min_fleet(task: tuple[int, str, str, float]) -> tuple[str, int, bool, int]:
             return key, 0, True, 0
         p = solve(s, matrix=build_matrix(s.depot, s.customers), time_limit_s=limit,
                   workers=1, max_trips=4, tiebreak_phase=False)
-        if p.is_usable and not p.mandatory_missed:
+        # 落としてよいのは計画配送だけ。欠品の直前と発注は落とせない
+        must = {c.id for c in s.customers if c.mandatory_basis in ("stockout", "order")}
+        if p.is_usable and not [u for u in p.mandatory_missed if u.customer_id in must]:
             return key, size, True, sum(vd.duty_min for vd in p.vehicle_days)
     return key, MAX_FLEET, False, MAX_FLEET * DUTY_CAP_MIN
 
@@ -175,8 +184,8 @@ def _report(label: str, daily: list[int]) -> None:
     print(f"  前提: 冬に抜けるのは故障だけ（{BREAKDOWN_RATE_WINTER:.0%}、点検は夏に入れる）、"
           f"待機の非専属は稼働率{MIN_STANDBY_UTILIZATION:.0%}以上"
           f"（うち系列外の仕事{OTHER_BUSINESS_SHARE:.0%}）、"
-          f"逃げ道は半期の{ESCAPE_TOLERANCE:.0%}まで")
-    print(f"  {'専属':>4} {'待機の非専属':>10} {'呼ばれる割合':>8} {'逃げ道に頼る日':>12} {'元売の運賃':>9}")
+          f"応えられない日は半期の{ESCAPE_TOLERANCE:.0%}まで")
+    print(f"  {'専属':>4} {'待機の非専属':>10} {'呼ばれる割合':>8} {'応えられない日':>12} {'元売の運賃':>9}")
     lo = max(0, min(r.dedicated, cost_only) - 1)
     for o in opts[lo:]:
         mark = " ← 推奨" if o is r else ""
@@ -186,9 +195,9 @@ def _report(label: str, daily: list[int]) -> None:
               f" {o.cost / r.cost:>8.1%}{mark}")
     print(f"  払う側の費用だけで決めた答えは専属{cost_only}台（非専属を無制限に呼べる前提）。")
     if r.chronic:
-        peak = max(o.dedicated for o in options)
-        print(f"  **故障の穴埋めに非専属を確保する前提では、逃げ道に頼る日が目安を超える"
-              f"（{r.escape_days}日/{len(daily)}日）。** 逃げ道を目安内に収めるには専属を"
+        peak = max(o.dedicated for o in opts)
+        print(f"  **故障の穴埋めに非専属を確保する前提では、応えられない日が目安を超える"
+              f"（{r.escape_days}日/{len(daily)}日）。** 目安内に収めるには専属を"
               f"ピーク（{peak}台）まで積むことになり、そのときは待機の非専属が0台になる"
               f"＝故障を埋める車が無い。どちらを取るかは元売と運送会社の判断。")
 

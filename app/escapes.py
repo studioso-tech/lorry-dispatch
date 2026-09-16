@@ -1,11 +1,13 @@
-"""逃げ道の記録と、恒常化の監視。**このプロジェクトの新規性の核。**
+"""応えられなかった日の記録と、恒常化の監視。**このプロジェクトの新規性の核。**
 
-逃げ道（計画配送を明日にずらす、拘束を延ばす、配送圏を越える、欠品）は
-**一時的なら可、恒常的なら構造の欠陥**（実務）。1日ずつ見ていると、どの日も
-「今日は仕方がない」で済んでしまう。日をまたいで数えて初めて、構造の問題が
-見える。
+数えるのは**欠品**（今日行かないと明日の配送より先に空になる）と、**発注に
+応えられないこと**。**計画配送を明日にずらすのは数えない**——在庫が切れない限り
+前後に動かせるので、ふつうの運用の幅にあたる（実務・2026-09-16）。
 
-    その日の組み直し → 使った逃げ道を記録 → 直近30日で数える
+一時的なら可、恒常的なら構造の欠陥（実務）。1日ずつ見ていると、どの日も
+「今日は仕方がない」で済んでしまう。日をまたいで数えて初めて、構造の問題が見える。
+
+    その日の組み直し → 応えられなかった先を記録 → 直近30日で数える
       → 目安を超えたら「恒常化の恐れ」として、体制の見直しを提案する
 
 提案の中身は体制設計（scripts/size_carrier.py）につながる: 専属の積み増し、
@@ -41,7 +43,7 @@ def _ref(date: str):
 
 
 def record(date: str, escapes: list[Escape] | tuple[Escape, ...], *, plan_id: str = "") -> None:
-    """その日に使った逃げ道を足す。試算（dry_run）の結果は記録しないこと。"""
+    """その日に応えられなかった先を足す。試算（dry_run）の結果は記録しないこと。"""
     rows = [
         {
             "kind": e.kind,
@@ -77,7 +79,7 @@ def _rows_between(start: str, end: str) -> dict[str, list[dict[str, Any]]]:
 
 
 def summary(as_of: str, *, window_days: int = WINDOW_DAYS) -> dict[str, Any]:
-    """直近 window_days 日の逃げ道を数え、恒常化の恐れがあるかを返す。"""
+    """直近 window_days 日の「応えられなかった日」を数え、恒常化の恐れを返す。"""
     end = datetime.date.fromisoformat(as_of)
     start = end - datetime.timedelta(days=window_days - 1)
     by_day = _rows_between(start.isoformat(), end.isoformat())
@@ -89,20 +91,20 @@ def summary(as_of: str, *, window_days: int = WINDOW_DAYS) -> dict[str, Any]:
 
     if chronic:
         message = (
-            f"直近{window_days}日で、計画配送をずらした日が{len(days)}日あります"
+            f"直近{window_days}日で、欠品・発注に応えられなかった日が{len(days)}日あります"
             f"（目安は{tolerance_days:.1f}日まで）。**恒常化の恐れがあります。**"
             "一時的なら可、恒常的なら構造の欠陥です。専属の積み増し、非専属の確保、"
             "配送圏の見直しのいずれかを、元売と運送会社で検討してください。"
         )
     elif days:
         message = (
-            f"直近{window_days}日で、計画配送をずらした日は{len(days)}日"
+            f"直近{window_days}日で、欠品・発注に応えられなかった日は{len(days)}日"
             f"（目安{tolerance_days:.1f}日以内）。一時的な範囲です。"
         )
     else:
-        message = f"直近{window_days}日で、逃げ道は使っていません。"
+        message = f"直近{window_days}日で、応えられなかった先はありません。"
     if repeat:
-        message += " 繰り返し後回しになっている先: " + "、".join(f"{n}（{k}回）" for n, k in repeat) + "。"
+        message += " 繰り返し応えられていない先: " + "、".join(f"{n}（{k}回）" for n, k in repeat) + "。"
 
     return {
         "as_of": as_of,

@@ -16,16 +16,17 @@ NewOrder は「証拠の所在」（source と evidence_ref）を必ず持つ。
 聞いて動いていて、積み込みを始めた便の油は車に載っている。**動かせるのは
 まだ積んでいない便だけ**で、それもなるべく崩さない。
 
-入らない発注があれば、次の順で手を打つ（ソルバーの目的関数がこの順に
-なるよう罰を置いてある）:
+入らない発注があれば、**その日と翌日にどれだけ余力が残るか**で手を選ぶ（実務）:
 
     1. 専属の余り（午後の空き）で運ぶ
-    2. 待機の非専属を呼ぶ（故障の穴埋めと同じく非専属が当たる。実務）
-    3. 計画配送を明日にずらす ← **逃げ道。使ったら記録する**
-    4. それでも入らない発注・欠品は「入らない」と正直に返す
+    2. 余力が20kLローリー1台ぶん以上残るなら、**計画配送を前後にずらして吸収**
+       （在庫が切れない限り自由に動かせるので費用がかからない）
+    3. 余力を割り込むなら、**費用を払ってでも非専属を動かす**（リスク対策）
+    4. それでも入らない発注・欠品は「入らない」と正直に返す ← **ここを記録する**
 
-逃げ道は一時的なら可、恒常的なら構造の欠陥（実務）。記録した逃げ道が
-積み上がったら体制の見直しを提案する（エージェント層の仕事）。
+実績は確定していても先は予定なので、不測の事態にどれだけ応えられるかで決める。
+**欠品と、発注に応えられないことが積み上がったら**体制の見直しを提案する
+（エージェント層の仕事）。一時的なら可、恒常的なら構造の欠陥（実務）。
 
 **近似**:
 
@@ -40,6 +41,7 @@ from dataclasses import dataclass, replace
 
 from core.domain import (
     COMPARTMENT_UNIT_L,
+    RESERVE_UNIT_L,
     DROP_STEP_BY_PRODUCT,
     MIN_STOP_DROP_L,
     Customer,
@@ -64,6 +66,16 @@ REPLAN_MAX_TRIPS = 3
 #: これより少ない量のためには車を出さない。**2kLだけの荷卸しはしない**（実務）ので、
 #: 1軒に降ろす合計がこれに満たなければ、SSに確認してからにする。
 MIN_DROP_L = MIN_STOP_DROP_L
+
+#: 予備能力がこれを下回るなら、費用を払ってでも非専属を動かす（実務・2026-09-16）。
+#:
+#: 判断は「小口かどうか」ではなく、**その日と翌日にどれだけ余力が残るか**。実績は
+#: 確定していても先は予定なので、不測の事態にどれだけ応えられるかで決める。
+#: 余力は**20kLローリー何台ぶんか**で数える（`domain.RESERVE_UNIT_L`）。
+#:
+#:     余力が1台ぶん以上残る → 計画配送を前後にずらして吸収（費用がかからない）
+#:     余力を割り込む       → 非専属を呼ぶ（費用はかかるがリスク対策）
+MIN_RESERVE_UNITS = 1
 
 #: 小口の発注とみなす量（1軒ぶんの合計）。**仮置。** 実務: 特殊な油種でなければ
 #: 2kL・4kLの発注はあり得ず、小口の発注は翌日の計画配送を前倒しして合わせて運ぶ。
@@ -120,9 +132,15 @@ class NewOrder:
 
 @dataclass(frozen=True)
 class Escape:
-    """使った逃げ道。**恒常化の監視はこれを数える。**"""
+    """応えられなかった先。**恒常化の監視はこれを数える。**
 
-    kind: str               # "defer_planned"（計画配送を明日にずらす）
+    **計画配送を明日にずらすのは、ここに入らない。** 在庫が切れない限り前後に
+    動かせるので、ふつうの運用の幅にあたる（実務・2026-09-16）。数えるのは
+    **欠品**（今日行かないと明日の配送より先に空になる）と、**発注に応えられない**
+    こと。この2つが積み上がるなら、体制のほうに無理がある。
+    """
+
+    kind: str               # "stockout"（欠品の直前）/ "order"（発注に応えられない）
     customer_id: str
     customer_name: str
     volume_l: int
@@ -143,7 +161,7 @@ class ReplanResult:
     orders: tuple[NewOrder, ...] = ()
     #: 発注量どおりに入らなかった発注と、その理由。**配車係がSSに確認する材料。**
     shortfalls: tuple[str, ...] = ()
-    #: 試算か。**試算の結果で車を動かしてはいけない**し、逃げ道も記録しない。
+    #: 試算か。**試算の結果で車を動かしてはいけない**し、記録もしない。
     dry_run: bool = False
 
     @property
@@ -162,7 +180,7 @@ class ReplanResult:
         if self.spot_called:
             parts.append(f"非専属を{len(self.spot_called)}台呼びます。")
         if self.escapes:
-            parts.append(f"計画配送{len(self.escapes)}軒を明日にずらします（逃げ道）。")
+            parts.append(f"**{len(self.escapes)}軒に応えられません（欠品・発注）。**")
         if self.unfilled:
             parts.append(f"**{len(self.unfilled)}軒は今日中に入りません。**")
         if self.shortfalls:
@@ -364,6 +382,26 @@ def replan(
         )
 
     # --- 4. 朝の担当を基準に解き直す --------------------------------------
+    # --- 予備能力（20kLローリー何台ぶん残るか） -----------------------------
+    #
+    # **計画配送は在庫が切れない限り前後に動かせる**（実務）ので、余力があるうちは
+    # ずらして吸収する。余力を割り込むなら、費用を払ってでも非専属を動かす。
+    remaining_demand = sum(c.demand_l for c in customers if c.id not in served_frozen)
+    # **数えるのは専属だけ。** 呼ぼうとしている非専属を余力に数えると、
+    # 「非専属がいるから余力あり→だから非専属は呼ばない」という堂々巡りになる
+    remaining_capacity = sum(
+        veh.capacity_l * max(0, REPLAN_MAX_TRIPS - len(frozen_by_vehicle.get(veh.id, [])))
+        for veh in vehicles if not veh.spot
+    )
+    reserve_units = (remaining_capacity - remaining_demand) // RESERVE_UNIT_L
+    ample = reserve_units >= MIN_RESERVE_UNITS
+    if ample:
+        # **余力があるうちは非専属を呼ばない。** 計画配送は在庫が切れない限り
+        # 前後に動かせるので、ずらして吸収するほうが安い。費用のほうを触ると
+        # 「何も差し込んでいないのに勝手にずらす」計画が出る（2026-09-16 に修正）。
+        vehicles = [v for v in vehicles if not v.spot]
+        drivers = [d for d in drivers if d.id not in {f"ds{k + 1}" for k in range(spot_standby)}]
+
     baseline = {
         st.customer_id: vd.vehicle_id
         for vd in base.vehicle_days
@@ -431,7 +469,6 @@ def replan(
                 new_assign[st.customer_id] = (vd.vehicle_id, offset + t.trip_index, st.arrive_min)
 
     changes: list[str] = []
-    escapes: list[Escape] = []
     for cid, old_vid in baseline.items():
         c = by_id[cid]
         if cid in new_assign:
@@ -442,8 +479,12 @@ def replan(
                     f"の{trip + 1}便目（{minutes_to_hhmm(arrive)}着）に担当替え"
                 )
         elif c.mandatory_basis == "planned":
-            escapes.append(Escape("defer_planned", cid, c.name, c.demand_l))
-            changes.append(f"{c.name}: 計画配送 {c.demand_l / 1000:.1f}kL を明日にずらす（逃げ道）")
+            # **計画配送をずらすのは逃げ道ではない**（在庫が切れない限り前後に
+            # 動かせる。実務・2026-09-16）。数えるのは欠品と、発注に応えられない日
+            why = "余力の範囲で" if ample else "**余力を割り込むため**"
+            changes.append(
+                f"{c.name}: 計画配送 {c.demand_l / 1000:.1f}kL を明日にずらす（{why}）"
+            )
 
     for o in orders:
         c = by_id[o.customer_id]
@@ -482,6 +523,12 @@ def replan(
         u for u in sub_plan.mandatory_missed
         if by_id[u.customer_id].mandatory_basis != "planned"
     )
+    # **恒常化の監視が数えるのはここ。** 欠品と、発注に応えられなかった先。
+    escapes = [
+        Escape(by_id[u.customer_id].mandatory_basis or "shortage",
+               u.customer_id, u.customer_name, u.demand_l)
+        for u in unfilled
+    ]
 
     return ReplanResult(
         now_min=now_min,

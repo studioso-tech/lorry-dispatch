@@ -132,23 +132,33 @@ def test_without_spot_a_planned_delivery_is_deferred_not_the_order():
     r = replan(s1, base, now_min=s1.depot.open_min,
                orders=[NewOrder(twin.id, product, whole_compartments_l(min(volume, room)), "system", "ORD-T")])
     assert r.ok, format_replan_ja(r)
-    assert [e.customer_id for e in r.escapes] == [planned.id]
-    assert r.escapes[0].kind == "defer_planned"
     placed = {st.customer_id for vd in r.sub_plan.vehicle_days for t in vd.trips for st in t.stops}
     assert placed == {twin.id}
-
-
-def test_spot_is_called_before_deferring_planned_deliveries():
-    """待機の非専属がいれば、計画配送をずらす前に非専属を呼ぶ。
-
-    専属に余りがあると非専属を呼ぶ理由が無いので、**車を1台に絞って**
-    確実に足りない形を作る。
-    """
-    s, base = _base(20261016, "2026-10-16", ("v5",))
-    r = replan(s, base, now_min=8 * 60, orders=_surge(s, base), spot_standby=2)
-    assert r.ok
-    assert r.spot_called
+    assert any(planned.name in c and "明日にずらす" in c for c in r.changes), r.changes
+    # **計画配送をずらすのは逃げ道ではない**（在庫が切れない限り前後に動かせる）。
+    # 監視が数えるのは欠品と、発注に応えられないこと。ここではどちらも起きていない
     assert not r.escapes
+
+
+def test_spot_is_called_only_when_the_reserve_would_be_broken():
+    """**余力が残るならずらして吸収、割り込むなら費用を払って非専属を呼ぶ**（実務）。
+
+    判断は「小口かどうか」ではなく、その日と翌日にどれだけ余力が残るか。余力は
+    **20kLローリー何台ぶんか**で数える（domain.RESERVE_UNIT_L）。実績は確定でも
+    先は予定なので、不測の事態に応える力を残しておく、という考え方。
+    """
+    date = "2026-10-16"
+    # 余力がある（保有をそろえた）とき: 非専属は呼ばない
+    full, base_full = _base(20261016, date, ("v1", "v2", "v3", "v4", "v5", "v6"))
+    ample = replan(full, base_full, now_min=8 * 60, orders=_surge(full, base_full),
+                   spot_standby=2)
+    assert not ample.spot_called, ample.changes
+
+    # 余力を割り込む（車を1台に絞った）とき: 費用を払って非専属を呼ぶ
+    small, base_small = _base(20261016, date, ("v5",))
+    thin = replan(small, base_small, now_min=8 * 60, orders=_surge(small, base_small),
+                  spot_standby=2)
+    assert thin.spot_called, thin.changes
 
 
 def test_order_that_does_not_fit_is_flagged_not_trimmed():

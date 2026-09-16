@@ -220,20 +220,28 @@ def test_solution_is_reproducible_when_both_phases_prove_optimality():
     複数便の求解を速くして、既定の条件でもこれが言えるようにするのが
     W2 に残っている課題。
     """
-    # **冬は証明まで届かなくなった**（2026-09-16、SSの規模を実務に寄せた）。
-    # ここで確かめたいのは「両段とも証明できたなら計画は一意」なので、
-    # 灯油が落ち着いて軽くなる夏で見る。冬の再現性は slow テスト（決定的時間）で見る。
+    # **確かめるのは「証明できたときだけ再現できると申告する」こと。**
+    # 実時間で打ち切る以上、証明が間に合うかは機械の速さに左右される（3回のうち
+    # 1回だけ2段目が間に合わない、ということが起きた）。時間任せの確認にすると
+    # テスト自体が揺れるので、申告と中身の一致を見る形にした（2026-09-16）。
+    #
+    # 冬は規模を実務に寄せてから証明まで届かない。ここは軽い夏で見る。
+    # 冬の再現性は slow テスト（決定的時間・上限なし）で見る。
     runs = []
     for _ in range(3):
         s = generate(seed=20261015, season="summer")
         m = build_matrix(s.depot, s.customers)
         runs.append(solve(s, matrix=m, time_limit_s=30.0, max_trips=1))
 
-    assert all(r.diagnostics["reproducible"] for r in runs), [
-        (r.diagnostics["phase1_status"], r.diagnostics["phase2_status"]) for r in runs
-    ]
-    assert len({r.objective for r in runs}) == 1
-    assert len({_signature(r) for r in runs}) == 1
+    for r in runs:
+        proven = (r.diagnostics["phase1_status"] == "OPTIMAL"
+                  and r.diagnostics["phase2_status"] == "OPTIMAL")
+        assert r.diagnostics["reproducible"] is proven, r.diagnostics
+
+    proven_runs = [r for r in runs if r.diagnostics["reproducible"]]
+    assert proven_runs, "3回とも証明まで届かなかった（軽い日を選び直すこと）"
+    assert len({r.objective for r in proven_runs}) == 1
+    assert len({_signature(r) for r in proven_runs}) == 1
 
 
 def test_more_trips_serve_more_customers():

@@ -506,7 +506,8 @@ def _new_solver(
     return s
 
 
-def _split_into_deliveries(customers: tuple[Customer, ...]) -> tuple[Customer, ...]:
+def _split_into_deliveries(customers: tuple[Customer, ...],
+                           fleet: tuple[Vehicle, ...] = ()) -> tuple[Customer, ...]:
     """1軒の1日ぶんの需要を、**1台に載る「配送」に割る**。
 
     大型店は1日に十数kL売るので、1回では運びきれない。実務でも大型店には
@@ -518,7 +519,12 @@ def _split_into_deliveries(customers: tuple[Customer, ...]) -> tuple[Customer, .
     out: list[Customer] = []
     for c in customers:
         demand = c.demand_by_product()
-        cap = MAX_DROP_TRAILER_L if c.accepts_trailer else MAX_DROP_RIGID_L
+        # **その日に出せる車のいちばん大きいもの**に合わせて割る。実在する一番大きい
+        # 車（トレーラー24kL）で割ると、単車しかいない日に「どの車にも積めない荷」が
+        # できる（2026-09-16）。トレーラーが入れない先は単車の中で見る。
+        usable = [v.capacity_l for v in fleet if c.accepts_trailer or not v.is_trailer]
+        cap = min(max(usable, default=MAX_DROP_TRAILER_L),
+                  MAX_DROP_TRAILER_L if c.accepts_trailer else MAX_DROP_RIGID_L)
         if sum(demand.values()) <= cap:
             out.append(replace(c, fixed_demand=tuple(demand.items())))
             continue
@@ -559,6 +565,7 @@ def solve(
     log: bool = False,
     mode: SolveMode = SolveMode.FAST,
     baseline: dict[str, str] | None = None,
+    planned_defer_cost: int | None = None,
 ) -> Plan:
     """1日ぶんの配車を解く。
 
@@ -592,8 +599,8 @@ def solve(
     # **1軒を複数の便に分けて届けられるようにする。** 大型店は1日に2〜3回、
     # 他店との組み合わせで配送することがある（実務）。1回の訪問で降ろせるのは
     # 1台ぶんまでなので、それを超える需要は「配送」に割って別々の便に載せる。
-    customers = _split_into_deliveries(scenario.customers)
     fleet: tuple[Vehicle, ...] = scenario.usable_vehicles()
+    customers = _split_into_deliveries(scenario.customers, fleet)
     if matrix is None or len(matrix.minutes) != len(customers) + 1:
         matrix = build_matrix(depot, customers)
 
@@ -1043,7 +1050,14 @@ def solve(
         # 任意訪問（_optional_penalty）はいまの需要の作り方では出てこない
         # （量が出るのは計画配送・発注・欠品の直前だけで、どれも必須）。
         # 空いた車で翌日ぶんを前倒しする配送を入れるときの受け皿として残す。
-        p = PENALTY_BY_BASIS[c.mandatory_basis] if c.is_mandatory else _optional_penalty(c)
+        if c.is_mandatory:
+            p = PENALTY_BY_BASIS[c.mandatory_basis]
+            if c.mandatory_basis == "planned" and planned_defer_cost is not None:
+                # **計画配送は在庫が切れない限り前後に動かせる**（実務・2026-09-16）。
+                # 予備能力が残っているうちは、ずらして吸収するほうが安い。
+                p = planned_defer_cost
+        else:
+            p = _optional_penalty(c)
         if p:
             penalties.append(p * (1 - served[c_idx]))
 
