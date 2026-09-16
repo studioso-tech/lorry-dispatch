@@ -277,12 +277,21 @@ CLOSED_ON_SUNDAY: dict[CustomerType, bool] = {
 EPOCH = datetime.date(2026, 1, 4)
 
 
-#: 季節ごとの消費乗数。平年の季節差であって、寒波などの事象ではない。
-#: 灯油が冬に跳ね、夏はほぼ止まる。ガソリンは夏の行楽で少し伸びる。
+#: 季節ごとの消費乗数（秋＝1.00）。平年の季節差であって、寒波などの事象ではない。
+#:
+#: **全国の月別販売量（石油統計 年報・2023年）から計算した**（2026-09-16）。
+#: 出どころと計算は docs/統計の裏取り.md §2.1。
+#:
+#:     灯油     冬2.58 / 春1.05 / 夏0.46
+#:     ガソリン 冬0.98 / 春0.99 / 夏1.07
+#:     軽油     冬0.93 / 春0.96 / 夏0.97
+#:
+#: 以前は灯油の夏を0.15・春を0.8と置いていたが、統計より低すぎた（夏でも給湯・
+#: 農業用・業務用が残る）。**冬の2.6倍は統計の2.58とほぼ一致していた。**
 SEASON_MULTIPLIER: dict[str, dict[Product, float]] = {
-    "winter": {Product.KEROSENE: 2.6, Product.REGULAR: 0.95, Product.PREMIUM: 0.95, Product.GASOIL: 1.0},
-    "spring": {Product.KEROSENE: 0.8, Product.REGULAR: 1.0, Product.PREMIUM: 1.0, Product.GASOIL: 1.0},
-    "summer": {Product.KEROSENE: 0.15, Product.REGULAR: 1.1, Product.PREMIUM: 1.15, Product.GASOIL: 1.05},
+    "winter": {Product.KEROSENE: 2.58, Product.REGULAR: 0.98, Product.PREMIUM: 0.98, Product.GASOIL: 0.93},
+    "spring": {Product.KEROSENE: 1.05, Product.REGULAR: 0.99, Product.PREMIUM: 0.99, Product.GASOIL: 0.96},
+    "summer": {Product.KEROSENE: 0.46, Product.REGULAR: 1.07, Product.PREMIUM: 1.07, Product.GASOIL: 0.97},
     "autumn": {Product.KEROSENE: 1.0, Product.REGULAR: 1.0, Product.PREMIUM: 1.0, Product.GASOIL: 1.0},
 }
 

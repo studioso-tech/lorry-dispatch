@@ -217,15 +217,17 @@ def _free_customer(seed=20261016, date="2026-10-16"):
     s = generate(seed=seed, date=date, season="winter")
     base = solve(s, matrix=build_matrix(s.depot, s.customers), mode=SolveMode.REPRODUCIBLE)
     served = {st.customer_id for t in base.trips for st in t.stops}
-    # 発注は槽の単位（2kL・4kL）。空きに丸ごと入る量で頼む先を選ぶ
+    # 発注は油種の刻み（主要3油種は4kL槽の単位）。空きに丸ごと入る量で頼む先を選ぶ
+    from core.domain import whole_drops_l
+
     for c in s.customers:
         if c.id in served or not c.open_today:
             continue
         t = max(c.tanks, key=lambda t: t.topup_l)
-        vol = min(4_000, t.topup_l) // 2_000 * 2_000
+        vol = whole_drops_l(t.product, min(8_000, t.topup_l))
         if vol:
             return c.id, t.product.value, vol
-    raise AssertionError("2kL入る先が無い")
+    raise AssertionError("刻みのぶんが入る先が無い")
 
 
 def test_replan_inserts_an_order_with_its_evidence():

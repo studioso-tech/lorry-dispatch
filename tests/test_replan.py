@@ -39,11 +39,13 @@ def _surge(s, base, n=4):
     free = [c for c in s.customers if c.id not in served and c.open_today and c.accepts_delivery
             and c.window_close_min >= 15 * 60]
     orders = []
+    smallest = min(v.capacity_l for v in s.usable_vehicles())
     for c in free:
         t = max(c.tanks, key=lambda t: t.topup_l)
-        # 発注は槽の単位。4kL槽しかない単車（非専属を含む）でも運べるよう4kL単位で頼む
+        # 発注は槽の単位（4kL）。**1軒ぶんが1台に載る範囲で頼む**——その先の計画配送に
+        # 発注を足した量が車の容量を超えると、どの車でも運べず「入らない」になる
         vol = min(8_000, t.topup_l) // 4_000 * 4_000
-        if vol:
+        if vol and c.demand_l + vol <= smallest:
             orders.append(NewOrder(c.id, t.product, vol, "system", f"ORD-{len(orders) + 1:03d}"))
         if len(orders) == n:
             break
@@ -133,8 +135,12 @@ def test_without_spot_a_planned_delivery_is_deferred_not_the_order():
 
 
 def test_spot_is_called_before_deferring_planned_deliveries():
-    """待機の非専属がいれば、計画配送をずらす前に非専属を呼ぶ。"""
-    s, base = _base(20261016, "2026-10-16", ("v4", "v5"))
+    """待機の非専属がいれば、計画配送をずらす前に非専属を呼ぶ。
+
+    専属に余りがあると非専属を呼ぶ理由が無いので、**車を1台に絞って**
+    確実に足りない形を作る。
+    """
+    s, base = _base(20261016, "2026-10-16", ("v5",))
     r = replan(s, base, now_min=8 * 60, orders=_surge(s, base), spot_standby=2)
     assert r.ok
     assert r.spot_called
