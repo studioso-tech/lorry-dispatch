@@ -53,12 +53,14 @@ from core.generator import EPOCH, generate  # noqa: E402
 from core.solver import solve  # noqa: E402
 from core.travel import build_matrix  # noqa: E402
 
-#: エリアごとに台数を足していく順（単車を先に。scripts/size_fleet.py と同じ理由）。
-ADD_ORDER: tuple[str, ...] = ("v4", "v5", "v1", "v2", "v3")
+#: 1エリアに足せる台数の上限（掃引の打ち切り）。
+MAX_FLEET = 12
 
 # モデルを変えたら版を上げる（キャッシュに古い答えが残らないように）。
 # v3: 積込 40分 → 20分（実務）、日勤は5:00に車庫を出る
-CACHE = Path(__file__).resolve().parents[1] / "data" / "carrier_cache_v3.json"
+# v4: SSの規模を実務に寄せた（月150〜450kL）。1エリアの需要が約3倍になり、
+#     タンク・配送周期・分割配送が入った（2026-09-16）
+CACHE = Path(__file__).resolve().parents[1] / "data" / "carrier_cache_v4.json"
 
 #: 1人1日の拘束の上限（改善基準告示の原則13時間）。融通した場合の下限に使う。
 DUTY_CAP_MIN = 780
@@ -76,22 +78,20 @@ def min_fleet(task: tuple[int, str, str, float]) -> tuple[str, int, bool, int]:
     """1エリア・1日を、欠品ゼロで回る最小の台数で解く。
 
     Returns:
-        (キャッシュのキー, 台数, 5台で足りたか, 使った車の拘束時間の合計（分）)。
-        5台でも欠品が出るなら5を返し、足りなかったことを知らせる。
+        (キャッシュのキー, 台数, 上限内で足りたか, 使った車の拘束時間の合計（分）)。
+        MAX_FLEET 台でも欠品が出るならその台数を返し、足りなかったことを知らせる。
     """
     seed, date, season, limit = task
     key = f"{season}|{date}|{seed}"
-    for size in range(1, len(ADD_ORDER) + 1):
-        s = generate(seed=seed, date=date, season=season)
-        keep = set(ADD_ORDER[:size])
-        s.vehicles = tuple(v for v in s.vehicles if v.id in keep)
+    for size in range(1, MAX_FLEET + 1):
+        s = generate(seed=seed, date=date, season=season, fleet_size=size)
         if not any(c.demand_l for c in s.customers):
             return key, 0, True, 0
         p = solve(s, matrix=build_matrix(s.depot, s.customers), time_limit_s=limit,
                   workers=1, max_trips=4, tiebreak_phase=False)
         if p.is_usable and not p.mandatory_missed:
             return key, size, True, sum(vd.duty_min for vd in p.vehicle_days)
-    return key, len(ADD_ORDER), False, len(ADD_ORDER) * DUTY_CAP_MIN
+    return key, MAX_FLEET, False, MAX_FLEET * DUTY_CAP_MIN
 
 
 def main() -> int:

@@ -281,12 +281,14 @@ def replan(
             room = {t.product: t.topup_l for t in c2.tanks}
             new = dict(new_by_customer[c.id])
             # **小口の発注は、翌日の計画配送を前倒しして合わせ、当日1回で運ぶ**（実務）。
-            # 需要の多い油種は4kL槽の単位でしか運ばないので、2kLの発注だけでは車に積めない
+            # 明日運ぶはずの量を今日運ぶ（小口の発注はその中に含まれる）ので、
+            # **足すのではなく大きいほうを取る**。足すと空きに入らない
+            # （タンクの空きは配送の周期ぶんしかない。2026-09-16 に修正）。
             want = dict(new)
             if (sum(new.values()) <= SMALL_ORDER_MAX_L and c.tomorrow_planned
                     and c.id not in served_frozen):
                 for p, v in c.tomorrow_planned:
-                    want[p] = want.get(p, 0) + v
+                    want[p] = max(want.get(p, 0), v)
                 pulled[c.id] = tuple(c.tomorrow_planned)
             for p, v in want.items():
                 ordered_v = new.get(p, 0)

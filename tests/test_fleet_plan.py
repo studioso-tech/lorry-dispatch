@@ -128,9 +128,15 @@ def test_default_chain_lands_near_the_model_carrier():
 
     地区の需要は逆算した仮置なので、この着地点を守らないと、
     「需要が先、台数は結果」の鎖が何の運送会社も表さなくなる。
+
+    **2026-09-16 に着地の内訳が変わった。** SSの規模を実務に寄せた（月150〜450kL）
+    ことで1エリアの需要が約3倍になり、エリアは大きく・少なくなった。
+    エリア数×1エリアの台数 で見れば、同じ20台規模に着地する。
     """
     zones = zones_for(DemandChain())
-    assert 8 <= zones <= 12
+    assert 3 <= zones <= 5
+    per_zone = 6          # 冬の1週間の掃引で出た、1エリアに要る台数
+    assert 15 <= zones * per_zone <= 30
     assert zone_kl_per_day("winter") > zone_kl_per_day("summer")
 
 

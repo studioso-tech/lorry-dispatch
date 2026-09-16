@@ -106,12 +106,16 @@ def test_without_spot_a_planned_delivery_is_deferred_not_the_order():
     from core.domain import Scenario, compartment_units, fits_compartments, whole_compartments_l
 
     s = generate(seed=20261015, date="2026-10-15", season="winter")
-    planned = next(c for c in s.customers if c.planned and c.mandatory_basis == "planned")
+    # **1台に載る計画配送の先**を選ぶ（大型店の1日ぶんは1台に載らず、便を分けて運ぶ）。
+    planned, veh = next(
+        (c, v)
+        for c in s.customers if c.planned and c.mandatory_basis == "planned"
+        for v in s.vehicles
+        if (c.accepts_trailer or not v.is_trailer)
+        and c.demand_l <= v.capacity_l
+        and fits_compartments(v.compartments_l, *compartment_units(c.demand_by_product()))
+    )
     twin = replace(planned, id="c90", name="同じ場所の別のSS", planned=(), orders=())
-    # 計画配送の荷を槽に積める車を1台だけ置く（4kL槽だけの単車は2kLの荷を積めない）
-    veh = next(v for v in s.vehicles
-               if (planned.accepts_trailer or not v.is_trailer)
-               and fits_compartments(v.compartments_l, *compartment_units(planned.demand_by_product())))
     driver = s.driver(veh.driver_id)
     s1 = Scenario(date=s.date, season=s.season, seed=s.seed, depot=s.depot,
                   customers=(planned, twin),
@@ -213,8 +217,15 @@ def test_replan_without_orders_keeps_the_morning_plan(seed, date, now):
     r = replan(s, base, now_min=now, orders=[])
     assert r.changes == ()
     assert not r.escapes and not r.spot_called
-    before = {vd.vehicle_id: (vd.duty_end_min, [[st.customer_id for st in t.stops] for t in vd.trips])
-              for vd in base.vehicle_days}
-    after = {vd.vehicle_id: (vd.duty_end_min, [[st.customer_id for st in t.stops] for t in vd.trips])
-             for vd in r.vehicle_days}
-    assert before == after
+    # **見るのは担当**（どの車のどの便に、どの先が入るか）と帰庫時刻。便の中を回る
+    # 順番は、費用が同点なら入れ替わりうる（朝は再現モード、組み直しは実時間で
+    # 打ち切るため、同点の崩し方が揃わない）。順番まで固定したいなら、組み直しにも
+    # 決定的な打ち切りが要る——当日の要求には重すぎるので、ここでは担当で見る。
+    def assignment(days):
+        return {
+            vd.vehicle_id: (vd.duty_end_min,
+                            [sorted(st.customer_id for st in t.stops) for t in vd.trips])
+            for vd in days
+        }
+
+    assert assignment(base.vehicle_days) == assignment(r.vehicle_days)

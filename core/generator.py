@@ -340,6 +340,9 @@ FLEET: tuple[tuple[str, str, VehicleClass, tuple[int, ...]], ...] = (
     # 以前は 4/4/4/4 と 2/4/4/4 を置いていた（どちらもあり得ない）
     ("v4", "4号車", VehicleClass.RIGID, (2_000, 2_000, 2_000, 2_000, 4_000, 4_000)),           # 16kL 6槽
     ("v5", "5号車", VehicleClass.RIGID, (2_000, 2_000, 2_000, 4_000, 4_000)),                  # 14kL 5槽
+    # **6台目は掃引の答え**（2026-09-16）。SSの規模を実務に寄せたら、冬の1週間で
+    # 5台では木曜に浜田SSが落ちた。6台で7日とも落ちゼロ。台数は需要から出る。
+    ("v6", "6号車", VehicleClass.TRAILER, (2_000, 2_000, 4_000, 2_000, 4_000, 2_000, 4_000, 4_000)),  # 24kL 8槽
 )
 
 DRIVER_NAMES: tuple[str, ...] = ("乗務員A", "乗務員B", "乗務員C", "乗務員D", "乗務員E")
@@ -599,6 +602,7 @@ def generate(
     absent_drivers: tuple[str, ...] = (),
     declined_customers: tuple[str, ...] = (),
     sold_more: tuple[SoldMore, ...] = (),
+    fleet_size: int | None = None,
 ) -> Scenario:
     """1日ぶんの配車問題を作る。
 
@@ -611,6 +615,9 @@ def generate(
             下げたい需要家など。**事象なので外から与える**（生成器が勝手に
             作ると、見送りを注入したから計画が変わったのか、たまたまそういう
             日だったのかが切り分けられなくなる）。
+        fleet_size: 出せるローリーの台数。**台数は需要から出る答え**なので、
+            体制設計（scripts/size_fleet.py）がここを振って「欠品ゼロで回る
+            最小の台数」を探す。既定は保有の5台。
         sold_more: 見込みより売れた先（連休・値上げ前・寒波）。**朝の計画より前に
             分かっていた**ときに使う。日中に分かったなら replan に渡す。在庫を下げる
             のは乱数を引いたあとなので、事象の無い先は事象なしの日と完全に同じになる。
@@ -731,25 +738,37 @@ def generate(
     # 日数の範囲・タンクの無い油種を黙って通さない（名簿の綴りは上で確かめた）
     validate_events(customers, tuple(sold_more))
 
+    # **台数は需要から出る答え**なので、外から振れるようにしてある（size_fleet が掃引する）。
+    # 保有の5台を超える分は、同じ車格を順に足す（車格の構成比は変えない）。
+    count = len(FLEET) if fleet_size is None else fleet_size
+    if count < 1:
+        raise ValueError(f"台数は1台以上（{fleet_size}）")
     drivers = tuple(
         Driver(
             id=f"d{i + 1}",
-            name=name,
+            name=DRIVER_NAMES[i] if i < len(DRIVER_NAMES) else f"乗務員{i + 1}",
             available=f"d{i + 1}" not in absent_drivers,
         )
-        for i, name in enumerate(DRIVER_NAMES)
+        for i in range(count)
     )
 
-    vehicles = tuple(
-        Vehicle(
-            id=vid,
-            name=f"{vname}（{VEHICLE_CLASS_JA[vclass]} {sum(comps) // 1000}kL）",
-            vehicle_class=vclass,
-            compartments_l=comps,
-            driver_id=f"d{i + 1}",
+    # **同型の車が隣り合うように並べる。** ソルバーの対称性つぶしは隣り合う
+    # 同型の組にしか効かないので、並びが崩れていると探索が無駄に広がる。
+    patterns = [FLEET[i % len(FLEET)] for i in range(count)]
+    patterns.sort(key=lambda t: (t[2].value, sum(t[3]), t[3]))
+    vehicles = []
+    for i in range(count):
+        _vid, _vname, vclass, comps = patterns[i]
+        vehicles.append(
+            Vehicle(
+                id=f"v{i + 1}",
+                name=f"{i + 1}号車（{VEHICLE_CLASS_JA[vclass]} {sum(comps) // 1000}kL）",
+                vehicle_class=vclass,
+                compartments_l=comps,
+                driver_id=f"d{i + 1}",
+            )
         )
-        for i, (vid, vname, vclass, comps) in enumerate(FLEET)
-    )
+    vehicles = tuple(vehicles)
 
     return Scenario(
         date=date,
