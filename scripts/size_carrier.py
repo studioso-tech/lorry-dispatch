@@ -179,13 +179,18 @@ def _report(label: str, daily: list[int]) -> None:
     print(f"  {'専属':>4} {'待機の非専属':>10} {'呼ばれる割合':>8} {'逃げ道に頼る日':>12} {'元売の運賃':>9}")
     lo = max(0, min(r.dedicated, cost_only) - 1)
     for o in opts[lo:]:
-        mark = " ← 推奨" if o is r else ("  恒常化の恐れ" if o.chronic else "")
+        mark = " ← 推奨" if o is r else ""
+        mark += "  恒常化の恐れ" if o.chronic else ""
         util = f"{o.utilization:.0%}" if o.standby else "—"
         print(f"  {o.dedicated:>4}台 {o.standby:>8}台 {util:>6} {o.escape_days:>8}日/{len(daily)}日"
               f" {o.cost / r.cost:>8.1%}{mark}")
     print(f"  払う側の費用だけで決めた答えは専属{cost_only}台（非専属を無制限に呼べる前提）。")
     if r.chronic:
-        print("  **どの台数でも逃げ道に頼りすぎる。専属を増やしても解けない＝需要か配送圏の見直しが要る。**")
+        peak = max(o.dedicated for o in options)
+        print(f"  **故障の穴埋めに非専属を確保する前提では、逃げ道に頼る日が目安を超える"
+              f"（{r.escape_days}日/{len(daily)}日）。** 逃げ道を目安内に収めるには専属を"
+              f"ピーク（{peak}台）まで積むことになり、そのときは待機の非専属が0台になる"
+              f"＝故障を埋める車が無い。どちらを取るかは元売と運送会社の判断。")
 
 
 if __name__ == "__main__":

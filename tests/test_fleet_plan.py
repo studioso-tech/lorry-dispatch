@@ -194,19 +194,27 @@ def test_enough_dedicated_leaves_no_escape_days():
 
 
 def test_recommend_avoids_chronic_reliance_on_escape_routes():
-    """推奨は「恒常化の恐れが無い案」の中で元売の運賃が最小のもの。
+    """推奨は**故障の穴埋めの非専属を残したうえで**、逃げ道に頼らない案を優先する。
 
-    逃げ道（計画配送を1日ずらす、拘束を延ばす）は一時的なら可、恒常的なら
-    構造の欠陥（実務）。運賃が安くても、逃げ道に恒常的に頼る案は選ばない。
+    逃げ道（計画配送を1日ずらす）は一時的なら可、恒常的なら構造の欠陥（実務）。
+    運賃が安くても、逃げ道に頼る度合いが強い案は選ばない。
+
+    **ただしピークに合わせて専属を積む答えは取らない**（2026-09-16・実務）。
+    そのときは待機の非専属が0台になり、故障を埋める車が無くなる。逃げ道に頼る日が
+    数日出るのは織り込み済みで、そこは元売と運送会社の判断として出す。
     """
-    from core.fleet_plan import fleet_options, recommend
+    from core.fleet_plan import MIN_STANDBY_SPOT, fleet_options, recommend
 
     daily = [14] * 20 + [18] * 15 + [21] * 7
     opts = fleet_options(daily)
     r = recommend(opts)
-    assert not r.chronic
-    cheaper = [o for o in opts if o.cost < r.cost]
-    assert all(o.chronic for o in cheaper)
+    assert r.standby >= MIN_STANDBY_SPOT
+
+    kept = [o for o in opts if o.standby >= MIN_STANDBY_SPOT]
+    if any(not o.chronic for o in kept):
+        assert not r.chronic
+    # 推奨より安い案は、どれも逃げ道に頼る度合いが強い
+    assert all(o.escape_days >= r.escape_days for o in kept if o.cost < r.cost)
 
 
 
@@ -222,4 +230,24 @@ def test_non_affiliate_work_makes_standby_viable():
     without = recommend(fleet_options(daily, other_share=0.0))
     with_other = recommend(fleet_options(daily, other_share=0.5))
     assert with_other.standby >= without.standby
-    assert with_other.cost <= without.cost
+    # 系列外の仕事があると、待機を抱えたままでも逃げ道に頼らずに済む
+    assert with_other.escape_days <= without.escape_days
+
+def test_recommendation_keeps_a_standby_spot_for_breakdowns():
+    """**故障の穴埋めに、待機の非専属を必ず残す**（実務・2026-09-16）。
+
+    専属をピークまで積めば逃げ道はゼロにできるが、そのとき待機の非専属は0台＝
+    故障を埋める車が無い。実務は「専属はピークより少なく持ち、非専属を常時
+    1〜2台確保して、逃げ道に頼る日が数日出るのは織り込む」。
+    """
+    from core.fleet_plan import MIN_STANDBY_SPOT, fleet_options, recommend
+
+    # ふだんは10台、ピークだけ14台という半期（42日）
+    daily = [10] * 36 + [14] * 6
+    options = fleet_options(daily)
+    peak = max(o.dedicated for o in options)
+    assert any(o.dedicated == peak and o.standby == 0 for o in options), "ピークの案が無い"
+
+    r = recommend(options)
+    assert r.standby >= MIN_STANDBY_SPOT, "故障を埋める非専属が残っていない"
+    assert r.dedicated < peak, "ピークに合わせて積む答えになっている"
