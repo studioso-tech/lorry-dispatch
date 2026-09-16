@@ -56,8 +56,12 @@ from enum import Enum
 import ortools
 from ortools.sat.python import cp_model
 
+from dataclasses import replace
+
 from core.domain import (
     COMPARTMENT_UNIT_L,
+    MAX_DROP_RIGID_L,
+    MAX_DROP_TRAILER_L,
     DAY_SHIFT_DEPART_MIN,
     LABOR_BREAK_45_MIN,
     LABOR_BREAK_60_MIN,
@@ -67,6 +71,7 @@ from core.domain import (
     LABOR_WORK_60_MIN,
     Customer,
     LegClass,
+    Product,
     Scenario,
     Vehicle,
     fits_compartments,
@@ -498,6 +503,48 @@ def _new_solver(
     return s
 
 
+def _split_into_deliveries(customers: tuple[Customer, ...]) -> tuple[Customer, ...]:
+    """1軒の1日ぶんの需要を、**1台に載る「配送」に割る**。
+
+    大型店は1日に十数kL売るので、1回では運びきれない。実務でも大型店には
+    1日に2〜3回、他店との組み合わせで配送する（実務・2026-09-16）。
+
+    割り方は「多い油種から、槽の単位で詰められるだけ詰める」。分けた配送は
+    同じ需要家（同じ id・座標・受入枠）を指し、別々の便に載せられる。
+    """
+    out: list[Customer] = []
+    for c in customers:
+        demand = c.demand_by_product()
+        cap = MAX_DROP_TRAILER_L if c.accepts_trailer else MAX_DROP_RIGID_L
+        if sum(demand.values()) <= cap:
+            out.append(replace(c, fixed_demand=tuple(demand.items())))
+            continue
+        # **均等に割る。** 「詰められるだけ詰める」と最後に2kLだけの配送が残り、
+        # 流下より準備・手仕舞の手間が大きい荷卸しになる（2kLだけは降ろさない・実務）。
+        total = sum(demand.values())
+        pieces = -(-total // cap)                       # 何回に分けるか
+        target = -(-total // pieces)                    # 1回あたりの目安
+        target = -(-target // COMPARTMENT_UNIT_L) * COMPARTMENT_UNIT_L
+        left = dict(demand)
+        while sum(left.values()) > 0:
+            chunk: dict[Product, int] = {}
+            room = min(cap, target) if sum(left.values()) > target else cap
+            for product in sorted(left, key=lambda p: (-left[p], p.value)):
+                take = min(left[product], room) // COMPARTMENT_UNIT_L * COMPARTMENT_UNIT_L
+                if take <= 0:
+                    continue
+                chunk[product] = take
+                left[product] -= take
+                room -= take
+                if room < COMPARTMENT_UNIT_L:
+                    break
+            if not chunk:
+                break
+            left = {p: v for p, v in left.items() if v > 0}
+            out.append(replace(c, fixed_demand=tuple(chunk.items())))
+    return tuple(out)
+
+
 def solve(
     scenario: Scenario,
     *,
@@ -539,9 +586,13 @@ def solve(
         配車係に説明する必要があるため。
     """
     depot = scenario.depot
-    customers = scenario.customers
+    # **1軒を複数の便に分けて届けられるようにする。** 大型店は1日に2〜3回、
+    # 他店との組み合わせで配送することがある（実務）。1回の訪問で降ろせるのは
+    # 1台ぶんまでなので、それを超える需要は「配送」に割って別々の便に載せる。
+    customers = _split_into_deliveries(scenario.customers)
     fleet: tuple[Vehicle, ...] = scenario.usable_vehicles()
-    matrix = matrix or build_matrix(depot, customers)
+    if matrix is None or len(matrix.minutes) != len(customers) + 1:
+        matrix = build_matrix(depot, customers)
 
     C = len(customers)
     R = max_trips
@@ -1253,17 +1304,19 @@ def solve(
             )
         )
 
-    unserved = tuple(
-        Unserved(
+    missed: dict[str, Unserved] = {}
+    for c_idx, c in enumerate(customers):
+        if c.demand_l <= 0 or solver.BooleanValue(served[c_idx]):
+            continue
+        before = missed.get(c.id)
+        missed[c.id] = Unserved(
             customer_id=c.id,
             customer_name=c.name,
-            demand_l=c.demand_l,
+            demand_l=c.demand_l + (before.demand_l if before else 0),
             mandatory=c.is_mandatory,
             days_to_empty=c.min_days_to_empty(),
         )
-        for c_idx, c in enumerate(customers)
-        if c.demand_l > 0 and not solver.BooleanValue(served[c_idx])
-    )
+    unserved = tuple(missed.values())
 
     return Plan(
         status=status_name,

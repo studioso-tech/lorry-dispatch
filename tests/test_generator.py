@@ -73,15 +73,16 @@ def test_winter_raises_kerosene_demand():
     assert kerosene_use(winter) > kerosene_use(summer) * 5
 
 
-def test_planned_delivery_comes_every_three_operating_days():
-    """計画配送の先には、営業日で数えてほぼ3日に1回、決まった周期で運ぶ。
+def test_planned_delivery_comes_on_that_stations_own_cycle():
+    """計画配送は、その先の周期（営業日で2日か3日）で決まった日に来る。
 
     以前は毎日「2日先に発注点を割るタンク」を満タンまで補充していて、
     計画配送の量が日によってばらついていた。実態は月〜土ほぼ一定量。
+    **周期は規模で決まる**ので、大型店は2日、ほかは3日になる。
     """
     import datetime
 
-    from core.generator import PLANNED_INTERVAL_DAYS
+    from core.generator import ROSTER, _interval_days
 
     start = datetime.date(2026, 10, 12)          # 月曜
     due: dict[str, list[int]] = {}
@@ -92,15 +93,17 @@ def test_planned_delivery_comes_every_three_operating_days():
                 continue
             due.setdefault(c.id, [])
             due[c.id].append(1 if c.planned else 0)
+    by_id = {spec.id: spec for spec in ROSTER}
     for cid, marks in due.items():
+        interval = _interval_days(by_id[cid])
         hits = [i for i, m in enumerate(marks) if m]
         assert hits, cid
-        # 配送の日は3営業日の刻みの上にだけ来る（間隔は3日か、その倍数）
-        assert all((b - a) % PLANNED_INTERVAL_DAYS == 0 for a, b in zip(hits, hits[1:])), cid
+        # 配送の日は、その先の周期の刻みの上にだけ来る
+        assert all((b - a) % interval == 0 for a, b in zip(hits, hits[1:])), cid
         # **量がまとまらない回は運ばない。** 主要3油種は4kL槽の単位でしか運ばず、
-        # 3日ぶんが4kLに満たない小さなSSでは、次の回にまとめる（2026-09-16）。
-        # それでも2回に1回は必ず運ぶ（6営業日以内）
-        assert all(b - a <= 2 * PLANNED_INTERVAL_DAYS for a, b in zip(hits, hits[1:])), cid
+        # 周期ぶんが4kLに満たない小さなSSでは、次の回にまとめる（2026-09-16）。
+        # それでも2回に1回は必ず運ぶ
+        assert all(b - a <= 2 * interval for a, b in zip(hits, hits[1:])), cid
 
 
 def test_mandatory_depends_on_whose_promise_it_is():
@@ -177,7 +180,8 @@ def test_order_is_capped_by_ullage():
     from core.domain import DROP_STEP_BY_PRODUCT, whole_drops_l
 
     c = next(x for x in generate(seed=20261015).customers if x.ordering)
-    t = c.tanks[0]
+    # 一番大きく空いているタンク（2kLだけの荷卸しはしないので、まとまる先で見る）
+    t = max(c.tanks, key=lambda t: t.topup_l)
     big = replace(c, orders=((t.product, t.capacity_l * 10),))
     got = big.demand_by_product().get(t.product, 0)
     assert got == whole_drops_l(t.product, t.topup_l)
@@ -339,22 +343,69 @@ def test_unload_time_depends_on_volume():
     assert small.service_min < large.service_min
 
 
-def test_every_tank_holds_a_cycle_and_a_compartment():
-    """どのタンクも、どの季節でも「3日ぶん＋その油種の刻み」が空き容量に収まる。
+def test_every_tank_holds_its_own_cycle_and_a_compartment():
+    """どのタンクも、どの季節でも「その先の周期ぶん＋刻み」が空き容量に収まる。
 
-    積込は槽の単位（主要3油種は4kL）なので、3日ぶんが刻みに満たない端数は次の配送へ
-    持ち越され、そのぶんタンクは低いまま残る（最大で刻み1つぶん未満）。収まらない
-    タンクは周期のうちに空になる。4kLの灯油タンク（冬に1日0.9kL）がそうだった。
+    タンクと周期は**規模から決まる**（_tanks_and_interval）。大型店は1日に十数kL
+    売るので3日ぶんは30kLのタンクにも入らない。そこは周期のほうを2日に縮める。
+    収まらないまま3日周期にすると、そのタンクは周期のうちに空になる。
     """
     from core.domain import DROP_STEP_BY_PRODUCT
-    from core.generator import PLANNED_INTERVAL_DAYS, PROFILES, SEASON_MULTIPLIER, ULLAGE_RATIO
+    from core.generator import (
+        ROSTER, SEASON_MULTIPLIER, ULLAGE_RATIO, _base_daily, _tanks_and_interval,
+    )
 
-    for typ, prof in PROFILES.items():
-        for p, (cap, base) in prof.tanks.items():
-            usable = cap - round(cap * ULLAGE_RATIO)
+    for spec in ROSTER:
+        caps, interval = _tanks_and_interval(spec)
+        assert 1 <= interval <= 3, (spec.id, interval)
+        for p, base in _base_daily(spec).items():
+            usable = caps[p] - round(caps[p] * ULLAGE_RATIO)
             for season, mult in SEASON_MULTIPLIER.items():
-                need = round(base * mult[p]) * PLANNED_INTERVAL_DAYS + DROP_STEP_BY_PRODUCT[p]
-                assert need <= usable, (typ, p, season, need, usable)
+                need = round(base * mult[p]) * interval + DROP_STEP_BY_PRODUCT[p]
+                assert need <= usable, (spec.id, p, season, need, usable)
+
+
+def test_big_stations_are_delivered_more_often():
+    """**大型店ほど配送が頻繁になる**（実務）。売る量に対してタンクが足りないため。"""
+    from core.generator import ROSTER, _interval_days
+
+    large = [_interval_days(s) for s in ROSTER if s.size == "large"]
+    small = [_interval_days(s) for s in ROSTER if s.size == "small"]
+    assert large and small
+    assert max(large) < min(small)
+
+
+def test_demand_comes_from_the_monthly_scale_of_the_station():
+    """需要は「月間いくら売るSSか」から割り出す。合計は月間販売量に一致する。"""
+    from core.generator import (
+        MIX, OPERATING_DAYS_PER_MONTH, ROSTER, SIZE_MONTHLY_L, _SEASON_AVG, _base_daily,
+    )
+
+    for spec in ROSTER:
+        got = sum(v * _SEASON_AVG[p] for p, v in _base_daily(spec).items())
+        want = SIZE_MONTHLY_L[spec.size] / OPERATING_DAYS_PER_MONTH
+        assert abs(got - want) / want < 0.01, (spec.id, got, want)
+        # 立地の構成どおりか（ガソリン＝レギュラー＋ハイオク）
+        from core.domain import Product
+
+        daily = _base_daily(spec)
+        gasoline = sum(daily.get(p, 0) * _SEASON_AVG[p]
+                       for p in (Product.REGULAR, Product.PREMIUM))
+        assert abs(gasoline / want - MIX[spec.mix]["gasoline"]) < 0.01, spec.id
+
+
+def test_premium_is_about_one_seventh_of_the_gasoline():
+    """ハイオクはガソリンの14.5%（生産量の統計）。"""
+    from core.domain import Product
+    from core.generator import PREMIUM_SHARE_OF_GASOLINE, ROSTER, _SEASON_AVG, _base_daily
+
+    for spec in ROSTER:
+        daily = _base_daily(spec)
+        if Product.REGULAR not in daily:
+            continue
+        reg = daily[Product.REGULAR] * _SEASON_AVG[Product.REGULAR]
+        pre = daily[Product.PREMIUM] * _SEASON_AVG[Product.PREMIUM]
+        assert abs(pre / (reg + pre) - PREMIUM_SHARE_OF_GASOLINE) < 0.01, spec.id
 
 
 def test_planned_quantities_are_whole_compartments_and_match_sales_over_time():

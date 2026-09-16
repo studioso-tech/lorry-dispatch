@@ -251,6 +251,15 @@ DROP_STEP_BY_PRODUCT: dict[Product, int] = {
 MIN_STOP_DROP_L = 4_000
 
 
+#: 1回の訪問で降ろせる量の上限（L）。**これを超える量は複数の便に分けて届ける**（実務）。
+#:
+#: 実在する一番大きい車はトレーラー24kL、単車16kL。大型店には1日に2〜3回、
+#: 他店との組み合わせで配送することがある（実務・2026-09-16）。solver が
+#: 1軒の需要をこの上限以下の「配送」に割って、別々の便に載せられるようにする。
+MAX_DROP_TRAILER_L = 24_000
+MAX_DROP_RIGID_L = 16_000
+
+
 def whole_drops_l(product: Product, volume_l: int) -> int:
     """その油種の刻み（主要3油種は4kL、ハイオクは2kL）に切り捨てる。"""
     step = DROP_STEP_BY_PRODUCT[product]
@@ -440,6 +449,10 @@ class Customer:
     #: その日でなければ空。
     planned: tuple[tuple["Product", int], ...] = ()
 
+    #: **この訪問で降ろす量**（油種, L）。1軒を2便・3便に分けて届けるとき、
+    #: 分けた1回ぶんをここに持つ（solver が作る）。None なら在庫と計画から決める。
+    fixed_demand: tuple[tuple["Product", int], ...] | None = None
+
     #: 明日の計画配送（油種, L）。明日がその日でなければ空。**今日は運ばない。**
     #: 小口の発注が入ったら、これを前倒しして合わせ、当日1回で運ぶ（実務）。
     tomorrow_planned: tuple[tuple["Product", int], ...] = ()
@@ -545,6 +558,8 @@ class Customer:
         （DROP_STEP_BY_PRODUCT）。**欠品の直前だけは緊急**で、2kLの単位まで降ろす
         （4kL槽に2kLだけ積むこともある。実務）。
         """
+        if self.fixed_demand is not None:
+            return dict(self.fixed_demand)
         if not self.accepts_delivery or not self.open_today:
             return {}
         ordered = dict(self.orders)

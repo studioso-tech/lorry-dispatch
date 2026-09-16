@@ -142,11 +142,32 @@ def test_travel_chain_is_consistent(seed):
 
 
 @pytest.mark.parametrize("seed", SEEDS)
-def test_each_customer_visited_at_most_once(seed):
-    """同じ需要家を2度回らない。便をまたいでも1回きり。"""
-    _, _, plan = _plan(seed=seed)
-    visited = [s.customer_id for tr in plan.trips for s in tr.stops]
-    assert len(visited) == len(set(visited))
+def test_a_big_station_can_be_visited_twice_and_still_gets_exactly_its_demand(seed):
+    """**大型店は1日に2〜3回に分けて届く**（実務・2026-09-16）。
+
+    1回の訪問で降ろせるのは1台ぶんまでなので、それを超える需要は便を分けて運ぶ。
+    分けても合計は需要どおりで、1回ごとの量は1台に載り、2kLだけの訪問にはしない。
+    """
+    from core.domain import MAX_DROP_RIGID_L, MAX_DROP_TRAILER_L, MIN_STOP_DROP_L
+
+    scenario, _, plan = _plan(seed=seed)
+    by_id = {c.id: c for c in scenario.customers}
+    missed = {u.customer_id for u in plan.unserved}
+
+    delivered: dict[str, int] = {}
+    for tr in plan.trips:
+        for s in tr.stops:
+            delivered[s.customer_id] = delivered.get(s.customer_id, 0) + s.delivered_l
+            c = by_id[s.customer_id]
+            cap = MAX_DROP_TRAILER_L if c.accepts_trailer else MAX_DROP_RIGID_L
+            assert s.delivered_l <= cap, (s.customer_name, s.delivered_l)
+            assert s.delivered_l >= MIN_STOP_DROP_L, (s.customer_name, s.delivered_l)
+
+    for cid, got in delivered.items():
+        want = by_id[cid].demand_l
+        assert got <= want, (cid, got, want)
+        if cid not in missed:
+            assert got == want, (cid, got, want)
 
 
 @pytest.mark.parametrize("seed", SEEDS)
