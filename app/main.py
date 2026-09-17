@@ -384,9 +384,10 @@ def _replan_body(req: PlanRequest, now: str, orders: list[NewOrder], spot_standb
                  *, dry_run: bool, plan_id: str, sold_more_now: list[SoldMoreIn] = ()) -> dict:
     """朝の計画を再現モードで組み直し、当日の発注を差し込む。
 
-    朝の計画を**再現モードで組み直す**のは、審査員が /api/plan で見た朝の計画と
-    必ず同じものを土台にするため（再現モードは同じ入力から同じ計画を返す）。
-    組み直しそのものは即応モード（時間で打ち切る）。
+    朝の計画は**要求と同じモードで組み直す**。審査員が /api/plan で見た朝の計画と
+    同じものを土台にするため。以前は常に再現モードで組み直していたが、即応モードで
+    計画を見た人には**別の計画が土台**になり、組み直しの説明が噛み合わなかった
+    （2026-09-17 修正）。組み直しそのものは即応モード（時間で打ち切る）。
 
     試算（dry_run）でなければ、応えられなかった先を記録する（恒常化の監視が数える）。
     """
@@ -395,8 +396,9 @@ def _replan_body(req: PlanRequest, now: str, orders: list[NewOrder], spot_standb
     base = solve(
         scenario,
         matrix=build_matrix(scenario.depot, scenario.customers),
+        time_limit_s=settings.solve_time_limit_s,
         workers=settings.solve_workers,
-        mode=SolveMode.REPRODUCIBLE,
+        mode=req.mode,
     )
     hh, mm = now.split(":")
     result = replan(
