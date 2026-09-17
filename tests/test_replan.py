@@ -106,12 +106,16 @@ def test_without_spot_a_planned_delivery_is_deferred_not_the_order():
     from core.domain import Scenario, compartment_units, fits_compartments, whole_compartments_l
 
     s = generate(seed=20261015, date="2026-10-15", season="winter")
-    planned = next(c for c in s.customers if c.planned and c.mandatory_basis == "planned")
+    # **1台に載る計画配送の先**を選ぶ（大型店の1日ぶんは1台に載らず、便を分けて運ぶ）。
+    planned, veh = next(
+        (c, v)
+        for c in s.customers if c.planned and c.mandatory_basis == "planned"
+        for v in s.vehicles
+        if (c.accepts_trailer or not v.is_trailer)
+        and c.demand_l <= v.capacity_l
+        and fits_compartments(v.compartments_l, *compartment_units(c.demand_by_product()))
+    )
     twin = replace(planned, id="c90", name="同じ場所の別のSS", planned=(), orders=())
-    # 計画配送の荷を槽に積める車を1台だけ置く（4kL槽だけの単車は2kLの荷を積めない）
-    veh = next(v for v in s.vehicles
-               if (planned.accepts_trailer or not v.is_trailer)
-               and fits_compartments(v.compartments_l, *compartment_units(planned.demand_by_product())))
     driver = s.driver(veh.driver_id)
     s1 = Scenario(date=s.date, season=s.season, seed=s.seed, depot=s.depot,
                   customers=(planned, twin),
@@ -128,23 +132,33 @@ def test_without_spot_a_planned_delivery_is_deferred_not_the_order():
     r = replan(s1, base, now_min=s1.depot.open_min,
                orders=[NewOrder(twin.id, product, whole_compartments_l(min(volume, room)), "system", "ORD-T")])
     assert r.ok, format_replan_ja(r)
-    assert [e.customer_id for e in r.escapes] == [planned.id]
-    assert r.escapes[0].kind == "defer_planned"
     placed = {st.customer_id for vd in r.sub_plan.vehicle_days for t in vd.trips for st in t.stops}
     assert placed == {twin.id}
-
-
-def test_spot_is_called_before_deferring_planned_deliveries():
-    """待機の非専属がいれば、計画配送をずらす前に非専属を呼ぶ。
-
-    専属に余りがあると非専属を呼ぶ理由が無いので、**車を1台に絞って**
-    確実に足りない形を作る。
-    """
-    s, base = _base(20261016, "2026-10-16", ("v5",))
-    r = replan(s, base, now_min=8 * 60, orders=_surge(s, base), spot_standby=2)
-    assert r.ok
-    assert r.spot_called
+    assert any(planned.name in c and "明日にずらす" in c for c in r.changes), r.changes
+    # **計画配送をずらすのは逃げ道ではない**（在庫が切れない限り前後に動かせる）。
+    # 監視が数えるのは欠品と、発注に応えられないこと。ここではどちらも起きていない
     assert not r.escapes
+
+
+def test_spot_is_called_only_when_the_reserve_would_be_broken():
+    """**余力が残るならずらして吸収、割り込むなら費用を払って非専属を呼ぶ**（実務）。
+
+    判断は「小口かどうか」ではなく、その日と翌日にどれだけ余力が残るか。余力は
+    **20kLローリー何台ぶんか**で数える（domain.RESERVE_UNIT_L）。実績は確定でも
+    先は予定なので、不測の事態に応える力を残しておく、という考え方。
+    """
+    date = "2026-10-16"
+    # 余力がある（保有をそろえた）とき: 非専属は呼ばない
+    full, base_full = _base(20261016, date, ("v1", "v2", "v3", "v4", "v5", "v6"))
+    ample = replan(full, base_full, now_min=8 * 60, orders=_surge(full, base_full),
+                   spot_standby=2)
+    assert not ample.spot_called, ample.changes
+
+    # 余力を割り込む（車を1台に絞った）とき: 費用を払って非専属を呼ぶ
+    small, base_small = _base(20261016, date, ("v5",))
+    thin = replan(small, base_small, now_min=8 * 60, orders=_surge(small, base_small),
+                  spot_standby=2)
+    assert thin.spot_called, thin.changes
 
 
 def test_order_that_does_not_fit_is_flagged_not_trimmed():
@@ -213,8 +227,15 @@ def test_replan_without_orders_keeps_the_morning_plan(seed, date, now):
     r = replan(s, base, now_min=now, orders=[])
     assert r.changes == ()
     assert not r.escapes and not r.spot_called
-    before = {vd.vehicle_id: (vd.duty_end_min, [[st.customer_id for st in t.stops] for t in vd.trips])
-              for vd in base.vehicle_days}
-    after = {vd.vehicle_id: (vd.duty_end_min, [[st.customer_id for st in t.stops] for t in vd.trips])
-             for vd in r.vehicle_days}
-    assert before == after
+    # **見るのは担当**（どの車のどの便に、どの先が入るか）と帰庫時刻。便の中を回る
+    # 順番は、費用が同点なら入れ替わりうる（朝は再現モード、組み直しは実時間で
+    # 打ち切るため、同点の崩し方が揃わない）。順番まで固定したいなら、組み直しにも
+    # 決定的な打ち切りが要る——当日の要求には重すぎるので、ここでは担当で見る。
+    def assignment(days):
+        return {
+            vd.vehicle_id: (vd.duty_end_min,
+                            [sorted(st.customer_id for st in t.stops) for t in vd.trips])
+            for vd in days
+        }
+
+    assert assignment(base.vehicle_days) == assignment(r.vehicle_days)

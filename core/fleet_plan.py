@@ -197,7 +197,8 @@ BREAKDOWN_RATE_WINTER = 0.01
 #: 融通しない場合）。正確な値を知らなくても結論は動かない。
 OTHER_BUSINESS_SHARE = 0.30
 
-#: 逃げ道（計画配送を1日ずらす、拘束を延ばす等）に頼ってよい日の割合の目安。
+#: **欠品・発注に応えられない日**が、半期のうちどれだけまでなら許容かの目安。
+#: （計画配送を1日ずらすのは在庫が切れない限り自由なので、ここには数えない）
 #: **仮置。** 一時的なら可、恒常的なら構造の欠陥（実務）。これを超える案は
 #: 「恒常化の恐れ」として印を付ける。
 ESCAPE_TOLERANCE = 0.05
@@ -213,7 +214,7 @@ class FleetOption:
         utilization: 待機の非専属が、**こちらから呼ばれて**動く割合。系列外の
             仕事（other_share）と合わせて稼働率の下限を満たせば運送会社は成り立つ。
         spot_vehicle_days: 非専属が実際に呼ばれた延べ台日。
-        escape_days: 専属＋待機でも足りず、逃げ道に頼る日数。
+        escape_days: 専属＋待機でも足りず、**欠品・発注に応えられない**日数。
         escape_vehicle_days: 逃げ道で吸収する延べ台日。
         cost: 元売の運賃（専属1台1日＝1、非専属は割増込み）。
         chronic: 逃げ道に頼る日が目安（ESCAPE_TOLERANCE）を超える＝恒常化の恐れ。
@@ -287,14 +288,34 @@ def fleet_options(
     return out
 
 
-def recommend(options: list[FleetOption]) -> FleetOption:
-    """恒常化の恐れが無い案のうち、元売の運賃が最小のもの。
+#: 常に確保しておく待機の非専属の最小台数。**故障・整備の穴埋めと需要の変動のため。**
+#:
+#: 実務（2026-09-16）: 専属はピークに合わせず、**ピークより少なく持ち、故障や変動の
+#: 穴埋めに非専属を常時1〜2台確保する**。逃げ道（計画配送を明日へ）に頼る日が数日
+#: 出るのは織り込み済み。
+#:
+#: これが無いと、推奨が「ピークに合わせて専属を積み、非専属ゼロ」に寄る。冬の半期の
+#: 掃引では専属21台・非専属0台という、**故障が起きたら埋める車が1台も無い**答えが出た。
+MIN_STANDBY_SPOT = 1
 
-    無ければ（どの台数でも逃げ道に頼りすぎる）、逃げ道の日数が最小の案。
-    その場合は**専属を増やしても解けない＝需要か配送圏の見直しが要る**という
-    ことなので、呼び出し側はそのまま伝えること。
+
+def recommend(options: list[FleetOption]) -> FleetOption:
+    """**故障の穴埋めの非専属を確保したうえで**、恒常化の恐れが無く運賃が最小の案。
+
+    順に緩める:
+
+    1. 待機の非専属が MIN_STANDBY_SPOT 台以上あり、恒常化の恐れも無い案
+    2. 待機の非専属はあるが、逃げ道が目安を超える案（逃げ道の少ない順）
+    3. どれも無ければ、逃げ道の日数が最小の案
+
+    2 まで落ちるのは「ピークに合わせなければ逃げ道に頼らざるを得ない」という
+    ことなので、呼び出し側は**逃げ道の日数をそのまま伝えること**。3 まで落ちたら
+    専属を増やしても解けない＝需要か配送圏の見直しが要る。
     """
-    ok = [o for o in options if not o.chronic]
+    with_standby = [o for o in options if o.standby >= MIN_STANDBY_SPOT]
+    ok = [o for o in with_standby if not o.chronic]
     if ok:
         return min(ok, key=lambda o: (o.cost, o.dedicated))
+    if with_standby:
+        return min(with_standby, key=lambda o: (o.escape_days, o.cost, o.dedicated))
     return min(options, key=lambda o: (o.escape_days, o.cost))

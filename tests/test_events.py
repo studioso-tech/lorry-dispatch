@@ -77,11 +77,15 @@ def test_generator_event_leaves_every_other_customer_identical():
 
 
 def test_selling_far_more_than_planned_turns_into_an_order_or_a_stockout():
-    """計画配送の日でない先が発注点を割れば、発注が入る（実際の当日発注の形）。"""
-    plain = _customer(generate(seed=20261015, date=DATE, season="winter"), "c02")
-    assert plain.mandatory_basis is None          # 今日は計画配送の日ではない
+    """計画配送の日でない先が発注点を割れば、発注が入る（実際の当日発注の形）。
+
+    どの先が「今日は計画配送の日でない」かは規模で変わる（大型店は毎日）ので、
+    日付を決め打ちにせず、その日のデータから探す。
+    """
+    day = generate(seed=20261015, date=DATE, season="winter")
+    plain = next(c for c in day.customers if c.mandatory_basis is None and c.open_today)
     hot = _customer(generate(seed=20261015, date=DATE, season="winter",
-                             sold_more=(SoldMore("c02", MAX_EXTRA_DAYS),)), "c02")
+                             sold_more=(SoldMore(plain.id, MAX_EXTRA_DAYS),)), plain.id)
     assert hot.mandatory_basis in ("order", "stockout")
 
 
@@ -114,12 +118,27 @@ def test_cli_notation():
 
 
 def _target():
-    """朝の計画に無い市内SS（当日発注の相手）。前提はデータ任せにせず、ここで組み立てる。"""
+    """当日発注の相手。**積込済みの便が向かっていない先**から、空きの大きいものを選ぶ。
+
+    以前は「朝の計画に無い先」を探していたが、SSの規模を実務に寄せてからは
+    需要のある先はほぼ毎日回るので、そういう先が無くなった（2026-09-16）。
+    """
     s, base = _morning()
-    served = {st.customer_id for t in base.trips for st in t.stops}
-    c = next(_customer(s, cid) for cid in ("c02", "c01", "c03", "c05", "c04")
-             if cid not in served and _customer(s, cid).open_today)
-    return s, base, c
+    frozen = {
+        st.customer_id
+        for vd in base.vehicle_days for t in vd.trips
+        if t.load_start_min < NOW for st in t.stops
+    }
+    room = {}
+    for c in s.customers:
+        if c.id in frozen or not c.open_today or not c.accepts_delivery:
+            continue
+        if not all(any(t.product is p for t in c.tanks)
+                   for p in (Product.REGULAR, Product.KEROSENE)):
+            continue
+        room[c.id] = next(t.topup_l for t in c.tanks if t.product is Product.REGULAR)
+    assert room, "積込済みの便が向かっていない先が無い"
+    return s, base, _customer(s, max(room, key=lambda cid: room[cid]))
 
 
 def _over_room(c, product):
@@ -182,19 +201,35 @@ def test_the_event_does_not_change_what_the_morning_trips_carried():
 # --- 小口の発注（翌日の計画配送を前倒しして合わせる） --------------------------
 
 
+SMALL_ORDER_L = 4_000
+
+
 def _small_order_case():
-    """明日が計画配送の日で、朝の計画に無い先を探す。"""
+    """小口の発注に、明日の計画配送を**前倒しして合わせられる**先を探す。
+
+    合わせて運ぶには、**明日のぶんもタンクに入る空き**が要る。配送周期が1日の先
+    （大型店や冬の郊外SS）は1日ぶんの空きしかないので成り立たない。周期が延びる
+    季節（灯油が落ち着く春夏）から探す。
+    """
     import datetime
 
-    for k in range(7):
-        d = (datetime.date(2026, 10, 12) + datetime.timedelta(days=k)).isoformat()
-        s = generate(seed=20261015, date=d, season="winter")
-        base = solve(s, matrix=build_matrix(s.depot, s.customers), mode=SolveMode.FAST, time_limit_s=20)
-        served = {st.customer_id for t in base.trips for st in t.stops}
-        for c in s.customers:
-            if c.tomorrow_planned and c.id not in served and c.open_today and c.accepts_delivery:
-                return s, base, c
-    raise AssertionError("明日が計画配送の日で朝の計画に無い先が1週間に無い")
+    for season in ("summer", "spring", "winter"):
+        for k in range(7):
+            d = (datetime.date(2026, 10, 12) + datetime.timedelta(days=k)).isoformat()
+            s = generate(seed=20261015, date=d, season=season)
+            for c in s.customers:
+                if not (c.tomorrow_planned and c.open_today and c.accepts_delivery):
+                    continue
+                product, planned_l = c.tomorrow_planned[0]
+                room = next(t.topup_l for t in c.tanks if t.product is product)
+                # 明日の量を今日に回すので、その量が入る空きがあればよい
+                if c.demand_l == 0 and room >= max(SMALL_ORDER_L, planned_l):
+                    base = solve(s, matrix=build_matrix(s.depot, s.customers),
+                                 mode=SolveMode.FAST, time_limit_s=20)
+                    served = {st.customer_id for t in base.trips for st in t.stops}
+                    if c.id not in served:
+                        return s, base, c
+    raise AssertionError("小口の発注に明日ぶんを合わせられる先が見つからない")
 
 
 def test_small_order_pulls_tomorrows_planned_delivery_forward():
@@ -206,7 +241,7 @@ def test_small_order_pulls_tomorrows_planned_delivery_forward():
     s, base, c = _small_order_case()
     p, _ = c.tomorrow_planned[0]
     r = replan(s, base, now_min=7 * 60, time_limit_s=30,
-               orders=[NewOrder(c.id, p, 4_000, "system", "ORD-SMALL")])
+               orders=[NewOrder(c.id, p, SMALL_ORDER_L, "system", "ORD-SMALL")])
     assert any("前倒し" in x and c.name in x for x in r.changes), r.changes
 
 

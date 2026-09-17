@@ -50,7 +50,6 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from core.domain import VEHICLE_CLASS_JA, Vehicle  # noqa: E402
 from core.generator import FLEET, generate  # noqa: E402
 from core.solver import solve  # noqa: E402
 from core.travel import build_matrix  # noqa: E402
@@ -60,7 +59,11 @@ from core.travel import build_matrix  # noqa: E402
 #: **単車を先に置く。** 単車しか入れない需要家があるので、トレーラーだけの
 #: 編成にするとその軒が最初から回れない。台数の答えが「足りないから増やす」
 #: ではなく「そもそも行けない」で歪む。
-ADD_ORDER: tuple[str, ...] = ("v4", "v5", "v1", "v2", "v3")
+#: 台数を1つずつ増やすときの順。**generate(fleet_size=) が小さい車から順に足す**
+#: （単車14kL → 単車16kL → トレーラー18/20/24…）。近い先へは単車が要るので、
+#: 小さい車から足すほうが「何台で回るか」を素直に測れる。
+#: 2026-09-16 に車IDの直接指定をやめた（保有台数を超えて掃引できなかったため）。
+MAX_FLEET = 12
 
 #: 拘束時間がこの割合を超えていたら「張り付いている」と見なす。
 #:
@@ -99,11 +102,9 @@ def evaluate(fleet_size: int, days, season: str, time_limit: float) -> list[DayR
     掃引ではコストと実行可能性しか要らないので tiebreak_phase=False。
     2段目（計画を一意に絞る処理）を丸ごと省けるぶん、倍近く速い。
     """
-    keep = set(ADD_ORDER[:fleet_size])
     out: list[DayResult] = []
     for seed, date in days:
-        s = generate(seed=seed, date=date, season=season)
-        s.vehicles = tuple(v for v in s.vehicles if v.id in keep)
+        s = generate(seed=seed, date=date, season=season, fleet_size=fleet_size)
         m = build_matrix(s.depot, s.customers)
         p = solve(
             s, matrix=m, time_limit_s=time_limit, max_trips=4, tiebreak_phase=False
@@ -139,7 +140,7 @@ def main() -> int:
     )
     ap.add_argument("--start", default="2026-10-12", help="初日（既定は月曜）")
     ap.add_argument("--time-limit", type=float, default=60.0)
-    ap.add_argument("--max-fleet", type=int, default=len(FLEET))
+    ap.add_argument("--max-fleet", type=int, default=MAX_FLEET)
     args = ap.parse_args()
 
     start = datetime.date.fromisoformat(args.start)
@@ -181,9 +182,8 @@ def main() -> int:
 
     print(f"【{args.season} の答え（1交代を前提）】")
     print(f"  必要なローリー: **{size}台**")
-    for i, vid in enumerate(ADD_ORDER[:size]):
-        v = next(x for x in FLEET if x[0] == vid)
-        print(f"      {v[1]}  {VEHICLE_CLASS_JA[v[2]]} {sum(v[3]) // 1000}kL")
+    for v in generate(seed=rows[0].seed, season=args.season, fleet_size=size).vehicles:
+        print(f"      {v.name}")
     print(f"  必要な乗務員: **{size}名**（1台1人）")
     if tight:
         worst = max(r.max_duty_min for r in tight)

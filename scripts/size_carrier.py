@@ -53,12 +53,17 @@ from core.generator import EPOCH, generate  # noqa: E402
 from core.solver import solve  # noqa: E402
 from core.travel import build_matrix  # noqa: E402
 
-#: エリアごとに台数を足していく順（単車を先に。scripts/size_fleet.py と同じ理由）。
-ADD_ORDER: tuple[str, ...] = ("v4", "v5", "v1", "v2", "v3")
+#: 1エリアに足せる台数の上限（掃引の打ち切り）。
+MAX_FLEET = 12
 
 # モデルを変えたら版を上げる（キャッシュに古い答えが残らないように）。
 # v3: 積込 40分 → 20分（実務）、日勤は5:00に車庫を出る
-CACHE = Path(__file__).resolve().parents[1] / "data" / "carrier_cache_v3.json"
+# v4: SSの規模を実務に寄せた（月150〜450kL）。1エリアの需要が約3倍になり、
+#     タンク・配送周期・分割配送が入った（2026-09-16）
+# v5: **計画配送は在庫が切れない限り前後に動かせる**（実務・2026-09-16）。
+#     「その日の計画配送を全部運べるか」ではなく「欠品と発注に応えられるか」で
+#     必要台数を数える
+CACHE = Path(__file__).resolve().parents[1] / "data" / "carrier_cache_v5.json"
 
 #: 1人1日の拘束の上限（改善基準告示の原則13時間）。融通した場合の下限に使う。
 DUTY_CAP_MIN = 780
@@ -73,25 +78,29 @@ def _week(year: int, month: int) -> list[datetime.date]:
 
 
 def min_fleet(task: tuple[int, str, str, float]) -> tuple[str, int, bool, int]:
-    """1エリア・1日を、欠品ゼロで回る最小の台数で解く。
+    """1エリア・1日を、**欠品ゼロ・発注に応えられる**最小の台数で解く。
+
+    **計画配送は在庫が切れない限り前後に動かせる**（実務・2026-09-16）ので、
+    その日の計画配送を全部運びきれたかは問わない。運べなかった計画配送は翌日に
+    回る（翌日の在庫が切れるなら、その日に欠品として現れる）。
 
     Returns:
-        (キャッシュのキー, 台数, 5台で足りたか, 使った車の拘束時間の合計（分）)。
-        5台でも欠品が出るなら5を返し、足りなかったことを知らせる。
+        (キャッシュのキー, 台数, 上限内で足りたか, 使った車の拘束時間の合計（分）)。
+        MAX_FLEET 台でも欠品が出るならその台数を返し、足りなかったことを知らせる。
     """
     seed, date, season, limit = task
     key = f"{season}|{date}|{seed}"
-    for size in range(1, len(ADD_ORDER) + 1):
-        s = generate(seed=seed, date=date, season=season)
-        keep = set(ADD_ORDER[:size])
-        s.vehicles = tuple(v for v in s.vehicles if v.id in keep)
+    for size in range(1, MAX_FLEET + 1):
+        s = generate(seed=seed, date=date, season=season, fleet_size=size)
         if not any(c.demand_l for c in s.customers):
             return key, 0, True, 0
         p = solve(s, matrix=build_matrix(s.depot, s.customers), time_limit_s=limit,
                   workers=1, max_trips=4, tiebreak_phase=False)
-        if p.is_usable and not p.mandatory_missed:
+        # 落としてよいのは計画配送だけ。欠品の直前と発注は落とせない
+        must = {c.id for c in s.customers if c.mandatory_basis in ("stockout", "order")}
+        if p.is_usable and not [u for u in p.mandatory_missed if u.customer_id in must]:
             return key, size, True, sum(vd.duty_min for vd in p.vehicle_days)
-    return key, len(ADD_ORDER), False, len(ADD_ORDER) * DUTY_CAP_MIN
+    return key, MAX_FLEET, False, MAX_FLEET * DUTY_CAP_MIN
 
 
 def main() -> int:
@@ -175,17 +184,22 @@ def _report(label: str, daily: list[int]) -> None:
     print(f"  前提: 冬に抜けるのは故障だけ（{BREAKDOWN_RATE_WINTER:.0%}、点検は夏に入れる）、"
           f"待機の非専属は稼働率{MIN_STANDBY_UTILIZATION:.0%}以上"
           f"（うち系列外の仕事{OTHER_BUSINESS_SHARE:.0%}）、"
-          f"逃げ道は半期の{ESCAPE_TOLERANCE:.0%}まで")
-    print(f"  {'専属':>4} {'待機の非専属':>10} {'呼ばれる割合':>8} {'逃げ道に頼る日':>12} {'元売の運賃':>9}")
+          f"応えられない日は半期の{ESCAPE_TOLERANCE:.0%}まで")
+    print(f"  {'専属':>4} {'待機の非専属':>10} {'呼ばれる割合':>8} {'応えられない日':>12} {'元売の運賃':>9}")
     lo = max(0, min(r.dedicated, cost_only) - 1)
     for o in opts[lo:]:
-        mark = " ← 推奨" if o is r else ("  恒常化の恐れ" if o.chronic else "")
+        mark = " ← 推奨" if o is r else ""
+        mark += "  恒常化の恐れ" if o.chronic else ""
         util = f"{o.utilization:.0%}" if o.standby else "—"
         print(f"  {o.dedicated:>4}台 {o.standby:>8}台 {util:>6} {o.escape_days:>8}日/{len(daily)}日"
               f" {o.cost / r.cost:>8.1%}{mark}")
     print(f"  払う側の費用だけで決めた答えは専属{cost_only}台（非専属を無制限に呼べる前提）。")
     if r.chronic:
-        print("  **どの台数でも逃げ道に頼りすぎる。専属を増やしても解けない＝需要か配送圏の見直しが要る。**")
+        peak = max(o.dedicated for o in opts)
+        print(f"  **故障の穴埋めに非専属を確保する前提では、応えられない日が目安を超える"
+              f"（{r.escape_days}日/{len(daily)}日）。** 目安内に収めるには専属を"
+              f"ピーク（{peak}台）まで積むことになり、そのときは待機の非専属が0台になる"
+              f"＝故障を埋める車が無い。どちらを取るかは元売と運送会社の判断。")
 
 
 if __name__ == "__main__":

@@ -388,7 +388,7 @@ def _replan_body(req: PlanRequest, now: str, orders: list[NewOrder], spot_standb
     必ず同じものを土台にするため（再現モードは同じ入力から同じ計画を返す）。
     組み直しそのものは即応モード（時間で打ち切る）。
 
-    試算（dry_run）でなければ、使った逃げ道を記録する（恒常化の監視が数える）。
+    試算（dry_run）でなければ、応えられなかった先を記録する（恒常化の監視が数える）。
     """
     scenario = _generate(req)
     events_now = tuple(e.to_event() for e in sold_more_now)
@@ -620,7 +620,7 @@ def make_return(req: ReturnRequest) -> dict:
 
 @app.get("/api/escapes")
 def escape_watch(as_of: str = "2026-10-15") -> dict:
-    """直近30日の逃げ道と、恒常化の恐れ。"""
+    """直近30日の「欠品・発注に応えられなかった日」と、恒常化の恐れ。"""
     try:
         return escapes.summary(as_of)
     except ValueError as exc:
