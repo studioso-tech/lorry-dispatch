@@ -230,11 +230,6 @@ def _free_customer(seed=20261016, date="2026-10-16"):
     raise AssertionError("刻みのぶんが入る先が無い")
 
 
-# 朝の計画を**再現モードで2回**組む（ここで1回、API の中で1回）。再現モードは
-# 時間ではなく探索量で切るので1回およそ90秒かかり、既定の180秒に収まらない。
-# 土台を fast にすると API 側の計画と食い違って当日発注の相手が変わるので、
-# 再現モードのまま上限だけ伸ばす。
-@pytest.mark.timeout(420)
 def test_replan_inserts_an_order_with_its_evidence():
     """FAXの発注を差し込むと、どの車で何時に着くかが証拠つきで返る。"""
     cid, product, vol = _free_customer()
@@ -272,8 +267,6 @@ def test_replan_rejects_unknown_customer():
 
 
 
-# ここも朝の計画を再現モードで2回組む（テストで1回、API の中で1回）。
-@pytest.mark.timeout(420)
 def test_return_endpoint_proposes_options_in_priority_order():
     """持ち戻りの連絡に、優先順の手と責任の所在を返す。"""
     from tests.test_returns import _day
@@ -288,3 +281,45 @@ def test_return_endpoint_proposes_options_in_priority_order():
     assert body["chosen"]["kind"] in ("redeliver", "cushion", "buyback")
     assert "元売の管理責任" in body["responsibility_ja"]
     assert any(o["kind"] == "buyback" for o in body["options"])
+
+
+# ---------------------------------------------------------------------------
+# 合言葉（審査用の関所）
+# ---------------------------------------------------------------------------
+
+
+def _with_key(monkeypatch, key: str):
+    """このプロセスの設定を、合言葉つきの設定に差し替える。"""
+    import dataclasses
+
+    from app import main as main_mod
+
+    monkeypatch.setattr(main_mod, "settings", dataclasses.replace(main_mod.settings, demo_key=key))
+
+
+def test_api_needs_the_passphrase_when_one_is_set(monkeypatch):
+    """合言葉を置いたら、無しでは動かす口に入れない。
+
+    公開URLで審査を受けるので、通りすがりの連打で求解とモデルを
+    動かされないようにする。**止めたいのは費用であって中身ではない。**
+    """
+    _with_key(monkeypatch, "marifu-2026")
+    r = client.post("/api/plan", json={"seed": 20261015, "mode": "fast"})
+    assert r.status_code == 401
+    assert "合言葉" in r.json()["detail"]
+
+
+def test_healthz_stays_open_even_with_a_passphrase(monkeypatch):
+    """生存確認は素通し。ここまで閉じると、動いているのかも分からなくなる。"""
+    _with_key(monkeypatch, "marifu-2026")
+    assert client.get("/api/healthz").status_code == 200
+
+
+def test_the_passphrase_passes_as_a_header_or_in_the_link(monkeypatch):
+    """ヘッダでも `?k=` でも通る。審査員にはリンク1本で渡したいため。"""
+    _with_key(monkeypatch, "marifu-2026")
+    body = {"seed": 20261015, "mode": "fast"}
+    assert client.post("/api/plan", json=body,
+                       headers={"X-Demo-Key": "marifu-2026"}).status_code == 200
+    assert client.post("/api/plan?k=marifu-2026", json=body).status_code == 200
+    assert client.post("/api/plan?k=chigau", json=body).status_code == 401

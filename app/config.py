@@ -32,6 +32,10 @@ class Settings:
     solve_workers: int
     #: 台帳のバックエンドに Firestore を使うか。未設定ならプロセス内メモリ。
     use_firestore_ledger: bool
+    #: 画面とAPIを使うための合言葉。**空なら関所を置かない**（手元と試験）。
+    #: 審査ではURLを公開にするので、ここを置いて通りすがりの連打を止める。
+    #: 秘密ではない（審査員に文字で渡す）。守るのは費用であって中身ではない。
+    demo_key: str
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -69,6 +73,7 @@ class Settings:
             solve_workers=int(os.getenv("SOLVE_WORKERS", "8")),
             use_firestore_ledger=bool(project)
             and os.getenv("USE_FIRESTORE_LEDGER", "TRUE").upper() == "TRUE",
+            demo_key=os.getenv("DEMO_KEY", ""),
         )
 
 

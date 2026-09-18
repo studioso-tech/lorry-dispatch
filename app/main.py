@@ -20,7 +20,8 @@ import uuid
 
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
+from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
@@ -33,7 +34,7 @@ from core.domain import minutes_to_hhmm
 from core.generator import generate
 from core.domain import Product
 from core.events import MAX_EXTRA_DAYS, SoldMore
-from core.replan import NewOrder, format_replan_ja, replan
+from core.replan import NewOrder, format_replan_ja, replan, validate_orders
 from core.returns import RESPONSIBILITY_JA, ReturnEvent, format_return_ja, handle_return
 from core.solver import Plan, SolveMode, VehicleDay, format_plan_ja, solve
 from core.travel import build_matrix
@@ -46,6 +47,42 @@ app = FastAPI(
     description="麻里布油槽所からの二次配送を組み、外の変化に応じて組み直す。",
     version="0.1.0",
 )
+
+
+# ---------------------------------------------------------------------------
+# 合言葉（審査用の関所）
+# ---------------------------------------------------------------------------
+#
+# 審査員にはURLだけで触ってもらいたいので、サービスは認証なしで公開する。
+# ただしURLを拾った誰かが連打すれば、求解のCPUとモデルの費用が出ていく。
+# そこで**モデルと求解を動かす口だけ**に合言葉を置く。
+#
+# これは秘密ではない。審査員には応募フォームと記事に文字で渡すので、
+# 本気の相手は止まらない。止めたいのは通りすがりの連打であり、
+# 支出そのものは app/ledger.py の日次・月次の上限が止める。
+#
+# 合言葉は `X-Demo-Key` ヘッダか `?k=` で受ける。`?k=` を許しているのは、
+# 審査員に**リンク1本**で渡せるようにするため（画面が憶えて以後は付けない）。
+# 画面そのもの（HTML・CSS・JS）と /api/healthz は素通しにする。関所に
+# 掛かって真っ白なページを見せられても、何が起きたか分からないため。
+
+_OPEN_PATHS = {"/api/healthz"}
+
+
+@app.middleware("http")
+async def require_demo_key(request: Request, call_next):
+    """合言葉を置いているときだけ、/api/ の口で確かめる。"""
+    key = settings.demo_key
+    path = request.url.path
+    if key and path.startswith("/api/") and path not in _OPEN_PATHS:
+        given = request.headers.get("x-demo-key") or request.query_params.get("k") or ""
+        if given != key:
+            return JSONResponse(
+                status_code=401,
+                content={"detail": "合言葉が要ります。審査用のリンク（?k=…）で開くか、"
+                                   "画面右上の「合言葉」に入れてください。"},
+            )
+    return await call_next(request)
 
 
 # ---------------------------------------------------------------------------
@@ -395,6 +432,9 @@ def _replan_body(req: PlanRequest, now: str, orders: list[NewOrder], spot_standb
     試算（dry_run）でなければ、応えられなかった先を記録する（恒常化の監視が数える）。
     """
     scenario = _generate(req)
+    # **組む前に発注を見る。** 朝の計画は1分以上かかるので、名簿に無い需要家の
+    # ような成り立たない発注に、その時間とCPUを使わせない。
+    validate_orders(scenario, orders)
     events_now = tuple(e.to_event() for e in sold_more_now)
     base = solve(
         scenario,

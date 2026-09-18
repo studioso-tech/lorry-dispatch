@@ -190,7 +190,12 @@ class ReplanResult:
         return "".join(parts)
 
 
-def _validate(scenario: Scenario, orders: list[NewOrder]) -> None:
+def validate_orders(scenario: Scenario, orders: list[NewOrder]) -> None:
+    """発注が名簿と噛み合っているかだけを見る。**組み直す前に呼べる。**
+
+    朝の計画を組むのに1分以上かかるので、名簿に無い需要家のような
+    そもそも成り立たない発注は、求解の前にここで弾く。
+    """
     by_id = {c.id: c for c in scenario.customers}
     for o in orders:
         c = by_id.get(o.customer_id)
@@ -234,7 +239,7 @@ def replan(
         ValueError: 名簿に無い需要家、タンクの無い油種、量が0以下の発注。
             黙って捨てると「発注を入れた計画」として読まれるので落とす。
     """
-    _validate(scenario, orders)
+    validate_orders(scenario, orders)
     validate_events(scenario.customers, tuple(sold_more))
     events_by_customer: dict[str, list[SoldMore]] = {}
     for e in sold_more:

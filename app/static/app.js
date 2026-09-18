@@ -21,6 +21,38 @@ function rich(text) {
 }
 const elRich = (tag, cls, text) => { const n = el(tag, cls); n.append(rich(text)); return n; };
 
+// --- 合言葉 -----------------------------------------------------------------
+// 審査員にはリンク1本で渡したいので、?k=… で来たら憶えて URL からは消す。
+// 憶える先はこのブラウザの中だけ（localStorage）。秘密ではないが、
+// 画面に出しっぱなしにしても得は無い。
+const KEY_STORE = "lorry.demo_key";
+
+function readKey() {
+  try { return localStorage.getItem(KEY_STORE) || ""; } catch { return ""; }
+}
+function saveKey(v) {
+  try { localStorage.setItem(KEY_STORE, v); } catch { /* 保存できなくても動く */ }
+}
+
+(function adoptKeyFromLink() {
+  const url = new URL(location.href);
+  const k = url.searchParams.get("k");
+  if (k) {
+    saveKey(k);
+    url.searchParams.delete("k");
+    history.replaceState(null, "", url.pathname + url.search + url.hash);
+  }
+  const box = document.getElementById("demo-key");
+  box.value = readKey();
+  box.addEventListener("change", () => saveKey(box.value.trim()));
+})();
+
+// 合言葉が要る場面（401）まで、欄は出さない。要らない手元では邪魔なだけ。
+function showKeyBox() {
+  document.getElementById("keybox").hidden = false;
+  document.getElementById("demo-key").focus();
+}
+
 // --- 上部のナビ -------------------------------------------------------------
 document.querySelectorAll(".tab").forEach((tab) => {
   tab.addEventListener("click", () => {
@@ -48,12 +80,15 @@ function waiting(node, what) {
 }
 
 async function post(path, body) {
-  const res = await fetch(path, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
+  const headers = { "Content-Type": "application/json" };
+  const key = readKey();
+  if (key) headers["X-Demo-Key"] = key;
+  const res = await fetch(path, { method: "POST", headers, body: JSON.stringify(body) });
   const data = await res.json().catch(() => ({}));
+  if (res.status === 401) {
+    showKeyBox();
+    throw new Error(data.detail || "合言葉が要ります");
+  }
   if (!res.ok) throw new Error(data.detail || `${res.status} ${res.statusText}`);
   return data;
 }

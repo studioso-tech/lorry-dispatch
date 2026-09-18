@@ -35,6 +35,10 @@ nav { display: flex; gap: 4px; }
   cursor: pointer;
 }
 .tab[aria-current="true"] { background: #fff; color: var(--ink); font-weight: 700; }
+/* 合言葉。要るときだけ出る（401を受けてから）。タブの右端に寄せる。 */
+#keybox { margin-left: auto; display: flex; align-items: center; gap: 6px;
+          font-size: 12px; color: var(--muted); padding-bottom: 8px; }
+#keybox input { padding: 3px 6px; font-size: 13px; }
 main { padding: 20px 24px 60px; max-width: 1080px; }
 .panel { animation: fade .12s ease-in; }
 @keyframes fade { from { opacity: 0 } to { opacity: 1 } }
