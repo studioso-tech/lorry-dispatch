@@ -148,6 +148,9 @@ def _clean_escapes():
     escapes.reset_for_tests()
 
 
+# 朝の計画を再現モードで2回組む（_free_customer で1回、API の中で1回）。
+# 再現モードは時間でなく探索量で切るので、既定の180秒には収まらない。
+@pytest.mark.timeout(420)
 def test_api_phone_note_returns_a_dry_run_and_records_nothing(monkeypatch):
     c, t = _free_customer()
     word = {"regular": "レギュラー", "premium": "ハイオク", "gasoil": "軽油", "kerosene": "灯油"}[t.product.value]
@@ -167,6 +170,9 @@ def test_api_phone_note_returns_a_dry_run_and_records_nothing(monkeypatch):
     assert escapes.summary("2026-10-16")["escape_count"] == 0
 
 
+# 朝の計画を再現モードで2回組む（_free_customer で1回、API の中で1回）。
+# 再現モードは時間でなく探索量で切るので、既定の180秒には収まらない。
+@pytest.mark.timeout(420)
 def test_api_fax_replans_when_everything_is_readable(monkeypatch):
     c, t = _free_customer()
     word = {"regular": "レギュラー", "premium": "ハイオク", "gasoil": "軽油", "kerosene": "灯油"}[t.product.value]

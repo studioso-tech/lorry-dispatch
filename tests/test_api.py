@@ -230,6 +230,11 @@ def _free_customer(seed=20261016, date="2026-10-16"):
     raise AssertionError("刻みのぶんが入る先が無い")
 
 
+# 朝の計画を**再現モードで2回**組む（ここで1回、API の中で1回）。再現モードは
+# 時間ではなく探索量で切るので1回およそ90秒かかり、既定の180秒に収まらない。
+# 土台を fast にすると API 側の計画と食い違って当日発注の相手が変わるので、
+# 再現モードのまま上限だけ伸ばす。
+@pytest.mark.timeout(420)
 def test_replan_inserts_an_order_with_its_evidence():
     """FAXの発注を差し込むと、どの車で何時に着くかが証拠つきで返る。"""
     cid, product, vol = _free_customer()
@@ -267,6 +272,8 @@ def test_replan_rejects_unknown_customer():
 
 
 
+# ここも朝の計画を再現モードで2回組む（テストで1回、API の中で1回）。
+@pytest.mark.timeout(420)
 def test_return_endpoint_proposes_options_in_priority_order():
     """持ち戻りの連絡に、優先順の手と責任の所在を返す。"""
     from tests.test_returns import _day

@@ -746,7 +746,7 @@ def generate(
     drivers = tuple(
         Driver(
             id=f"d{i + 1}",
-            name=DRIVER_NAMES[i] if i < len(DRIVER_NAMES) else f"乗務員{i + 1}",
+            name=DRIVER_NAMES[i] if i < len(DRIVER_NAMES) else f"乗務員{chr(ord('A') + i)}",
             available=f"d{i + 1}" not in absent_drivers,
         )
         for i in range(count)

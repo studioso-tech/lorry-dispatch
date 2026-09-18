@@ -18,7 +18,10 @@ import logging
 import time
 import uuid
 
+from pathlib import Path
+
 from fastapi import FastAPI, HTTPException
+from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel, Field
 
 import base64
@@ -597,8 +600,11 @@ def make_return(req: ReturnRequest) -> dict:
     """
     try:
         scenario = _generate(req)
+        # 朝の計画は**要求と同じモード**で組む（/api/replan と同じ理由。画面で見た
+        # 計画と別のものを土台にすると、出てくる手が噛み合わない）
         plan = solve(scenario, matrix=build_matrix(scenario.depot, scenario.customers),
-                     workers=settings.solve_workers, mode=SolveMode.REPRODUCIBLE)
+                     time_limit_s=settings.solve_time_limit_s,
+                     workers=settings.solve_workers, mode=req.mode)
         r = handle_return(scenario, plan, ReturnEvent(req.vehicle_id, req.customer_id,
                                                       req.product, req.volume_l))
     except ValueError as exc:
@@ -716,3 +722,22 @@ def scenario_view(
             for d in scenario.drivers
         ],
     }
+
+
+# ---------------------------------------------------------------------------
+# 画面（配車係が見る面）
+# ---------------------------------------------------------------------------
+#
+# **API の後ろに置く。** ルートは登録した順に見られるので、"/" の割り当てを先に
+# 書くと /api/... が画面に吸い込まれる。
+#
+# 追加のライブラリは使わない（素の HTML/CSS/JS）。審査員の手元で確実に開き、
+# 外の CDN が落ちても動くようにするため。
+
+_STATIC = Path(__file__).resolve().parent / "static"
+_DEMO = Path(__file__).resolve().parents[1] / "data" / "demo"
+
+if _DEMO.is_dir():
+    # デモ用のFAX画像。画面の「手元のサンプルを使う」がこれを読む。
+    app.mount("/demo", StaticFiles(directory=_DEMO), name="demo")
+app.mount("/", StaticFiles(directory=_STATIC, html=True), name="ui")

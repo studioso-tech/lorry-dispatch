@@ -1,0 +1,96 @@
+/* 配車係が1日じゅう見る画面なので、白地・高い密度・弱い装飾にする。 */
+:root {
+  --ink: #1b1b1b;
+  --muted: #5d6470;
+  --line: #d7dbe0;
+  --bg: #f7f8fa;
+  --accent: #14508c;
+  --warn: #9a3412;
+  --ok: #14532d;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  font: 15px/1.6 "Yu Gothic", "Hiragino Kaku Gothic ProN", Meiryo, system-ui, sans-serif;
+  color: var(--ink);
+  background: var(--bg);
+}
+header {
+  background: #fff;
+  border-bottom: 1px solid var(--line);
+  padding: 18px 24px 0;
+}
+h1 { font-size: 20px; margin: 0 0 4px; }
+.lead { margin: 0 0 14px; color: var(--muted); font-size: 13px; }
+nav { display: flex; gap: 4px; }
+.tab {
+  border: 1px solid var(--line);
+  border-bottom: none;
+  background: #eef1f5;
+  color: var(--muted);
+  padding: 9px 18px;
+  font: inherit;
+  font-size: 14px;
+  border-radius: 6px 6px 0 0;
+  cursor: pointer;
+}
+.tab[aria-current="true"] { background: #fff; color: var(--ink); font-weight: 700; }
+main { padding: 20px 24px 60px; max-width: 1080px; }
+.panel { animation: fade .12s ease-in; }
+@keyframes fade { from { opacity: 0 } to { opacity: 1 } }
+
+.controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 14px 18px;
+  align-items: flex-end;
+  background: #fff;
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  padding: 14px 16px;
+}
+.controls label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--muted); }
+.controls label.check { flex-direction: row; align-items: center; gap: 6px; font-size: 13px; color: var(--ink); }
+input, select { font: inherit; font-size: 14px; padding: 5px 7px; border: 1px solid var(--line); border-radius: 4px; background: #fff; }
+.go {
+  font: inherit; font-size: 14px; font-weight: 700;
+  background: var(--accent); color: #fff; border: none;
+  padding: 8px 20px; border-radius: 5px; cursor: pointer;
+}
+.go:disabled { background: #93a3b5; cursor: progress; }
+
+.status { margin: 14px 0; padding: 10px 14px; border-left: 3px solid var(--accent); background: #fff; font-size: 14px; }
+.status.error { border-color: var(--warn); color: var(--warn); }
+.summary { margin: 14px 0; padding: 12px 16px; background: #fff; border: 1px solid var(--line); border-radius: 8px; }
+.summary strong { font-size: 16px; }
+.summary .meta { color: var(--muted); font-size: 12px; margin-top: 6px; }
+
+.vehicles { display: grid; gap: 12px; }
+.vehicle { background: #fff; border: 1px solid var(--line); border-radius: 8px; padding: 12px 16px; }
+.vehicle h3 { margin: 0 0 2px; font-size: 15px; }
+.vehicle .duty { color: var(--muted); font-size: 12px; margin-bottom: 8px; }
+table { border-collapse: collapse; width: 100%; font-size: 13px; }
+th, td { text-align: left; padding: 4px 8px; border-bottom: 1px solid #eceff3; }
+th { color: var(--muted); font-weight: 400; font-size: 12px; }
+td.num { text-align: right; font-variant-numeric: tabular-nums; }
+.trip-head { color: var(--accent); font-size: 12px; margin: 8px 0 2px; }
+
+.unserved { margin-top: 14px; padding: 12px 16px; background: #fff; border: 1px solid var(--warn); border-radius: 8px; }
+.unserved h3 { margin: 0 0 6px; font-size: 14px; color: var(--warn); }
+
+.note { background: #fff; border: 1px solid var(--line); border-left: 3px solid var(--accent); border-radius: 6px; padding: 10px 14px; font-size: 13px; }
+.event { background: #fff; border: 1px solid var(--line); border-radius: 8px; margin: 14px 0; padding: 10px 14px; }
+.event summary { cursor: pointer; font-size: 14px; }
+.event .controls { border: none; padding: 12px 0 0; }
+.hint { color: var(--muted); font-size: 12px; margin: 6px 0 0; }
+
+.read, .result { margin-top: 14px; background: #fff; border: 1px solid var(--line); border-radius: 8px; padding: 12px 16px; }
+.read h3, .result h3 { margin: 0 0 8px; font-size: 14px; }
+ul.lines { margin: 0 0 10px; padding-left: 20px; }
+ul.lines li { margin-bottom: 4px; font-size: 14px; }
+li.check { color: var(--warn); }
+li.ok { color: var(--ok); }
+.kv { color: var(--muted); font-size: 12px; }
+pre.raw { background: #f2f4f7; padding: 10px; border-radius: 6px; overflow-x: auto; font-size: 12px; }
+
+footer { border-top: 1px solid var(--line); padding: 12px 24px; color: var(--muted); font-size: 12px; background: #fff; }

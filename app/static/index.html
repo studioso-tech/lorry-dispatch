@@ -1,0 +1,135 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>石油ローリー配車エージェント</title>
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+<header>
+  <h1>石油ローリー配車エージェント</h1>
+  <p class="lead">麻里布油槽所の二次配送。朝の計画を組み、当日入る発注や持ち戻りに合わせて組み直します。</p>
+  <nav>
+    <button class="tab" data-panel="plan" aria-current="true">今日の配車</button>
+    <button class="tab" data-panel="intake">当日の差し込み</button>
+    <button class="tab" data-panel="ret">持ち戻り</button>
+  </nav>
+</header>
+
+<main>
+  <!-- ------------------------------------------------ 今日の配車 -->
+  <section id="plan" class="panel">
+    <form id="plan-form" class="controls">
+      <label>日付 <input type="date" name="date" value="2026-10-16"></label>
+      <label>季節
+        <select name="season">
+          <option value="winter" selected>冬</option>
+          <option value="spring">春</option>
+          <option value="summer">夏</option>
+          <option value="autumn">秋</option>
+        </select>
+      </label>
+      <label>乱数種 <input type="number" name="seed" value="20261015"></label>
+      <label>求め方
+        <select name="mode">
+          <option value="fast" selected>即応（時間で打ち切る）</option>
+          <option value="reproducible">再現（どの機械でも同じ計画）</option>
+        </select>
+      </label>
+      <button type="submit" class="go">計画を組む</button>
+    </form>
+
+    <div id="plan-status" class="status" hidden></div>
+    <div id="plan-summary" class="summary" hidden></div>
+    <div id="plan-vehicles" class="vehicles"></div>
+    <div id="plan-unserved" class="unserved" hidden></div>
+  </section>
+
+  <!-- ------------------------------------------------ 当日の差し込み -->
+  <section id="intake" class="panel" hidden>
+    <p class="note">
+      <strong>発注は証拠の残る形でしか受けません。</strong>
+      発注システムかFAX。電話で連絡が入っても、発注書が届くまで車は動かしません。
+    </p>
+
+    <form id="intake-form" class="controls">
+      <label>いまの時刻 <input type="time" name="now" value="09:12"></label>
+      <label>FAXの発注書
+        <input type="file" name="fax" accept="image/png,image/jpeg">
+      </label>
+      <label class="check">
+        <input type="checkbox" name="sample" checked> 手元のサンプルを使う
+      </label>
+      <label>待機の非専属 <input type="number" name="spot" value="2" min="0" max="10"></label>
+      <button type="submit" class="go">読み取って組み直す</button>
+    </form>
+
+    <details class="event">
+      <summary>見込みより売れた先を足す（連休・値上げ前・寒波）</summary>
+      <div class="controls">
+        <label>需要家ID <input type="text" name="ev-customer" value="c02" size="6"></label>
+        <label>油種
+          <select name="ev-product">
+            <option value="">全油種</option>
+            <option value="regular" selected>レギュラー</option>
+            <option value="premium">ハイオク</option>
+            <option value="gasoil">軽油</option>
+            <option value="kerosene">灯油</option>
+          </select>
+        </label>
+        <label>何日ぶん多く <input type="number" name="ev-days" value="2" step="0.5" min="0" max="7"></label>
+        <label class="check"><input type="checkbox" name="ev-on" checked> この事象を当てる</label>
+      </div>
+      <p class="hint">
+        FAXの但し書き（「連休で来客が多く…」）を、在庫に当てるのがこれです。
+        当てないと、朝の見込みのままで組み直します。
+      </p>
+    </details>
+
+    <div id="intake-status" class="status" hidden></div>
+    <div id="intake-read" class="read" hidden></div>
+    <div id="intake-result" class="result" hidden></div>
+  </section>
+
+  <!-- ------------------------------------------------ 持ち戻り -->
+  <section id="ret" class="panel" hidden>
+    <p class="note">
+      計画配送の先の在庫は<strong>元売が管理</strong>します。持って行った量を降ろせないことが
+      まれに起きます（持ち戻り）。<strong>降ろすのが最優先</strong>で、次の配送がずれるのは受け入れます。
+    </p>
+    <form id="ret-form" class="controls">
+      <label>降ろせなかった立ち寄り
+        <select name="stop" required>
+          <option value="">先に「今日の配車」で計画を組んでください</option>
+        </select>
+      </label>
+      <label>油種
+        <select name="product">
+          <option value="kerosene" selected>灯油</option>
+          <option value="regular">レギュラー</option>
+          <option value="premium">ハイオク</option>
+          <option value="gasoil">軽油</option>
+        </select>
+      </label>
+      <label>量
+        <select name="volume">
+          <option value="2000">2kL（1槽）</option>
+          <option value="4000" selected>4kL（1槽）</option>
+          <option value="8000">8kL（2槽）</option>
+        </select>
+      </label>
+      <button type="submit" class="go">手を出す</button>
+    </form>
+    <div id="ret-status" class="status" hidden></div>
+    <div id="ret-result" class="result" hidden></div>
+  </section>
+</main>
+
+<footer>
+  <span id="foot-note">合成データです。座標と制約の形は実際の二次配送に合わせ、数字は作り物です。</span>
+</footer>
+
+<script src="/app.js"></script>
+</body>
+</html>

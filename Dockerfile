@@ -23,6 +23,8 @@ RUN pip install --no-cache-dir -r requirements.txt
 
 COPY app/ ./app/
 COPY core/ ./core/
+# 画面が読むデモ用のFAX画像（data/ の他のファイルは入れない）
+COPY data/demo/ ./data/demo/
 
 # Cloud Run は PORT を渡してくる。ローカルでは 8080 を既定にする。
 ENV PORT=8080
