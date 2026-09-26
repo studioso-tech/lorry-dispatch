@@ -511,6 +511,25 @@ def test_duty_contains_every_component(seed):
         ).max_duty_min
 
 
+@pytest.mark.parametrize("seed", SEEDS)
+def test_duty_leaves_the_rest_period_before_tomorrow(seed):
+    """帰庫から翌朝の出発まで、**継続11時間の休息期間**が空くこと（改善基準告示）。
+
+    拘束13時間だけを見ていると、遅く出て遅く帰る計画が通ってしまう。
+    1日ずつ解いているとその矛盾は見えない（明日は明日で5:00から解くため)。
+    日勤は5:00に出るので、帰庫は18:00が限界になる。
+    """
+    from core.domain import DAY_SHIFT_DEPART_MIN, MINUTES_PER_DAY, REST_PERIOD_MIN
+
+    _s, _m, plan = _plan(seed)
+    latest = DAY_SHIFT_DEPART_MIN + MINUTES_PER_DAY - REST_PERIOD_MIN
+    for vd in plan.vehicle_days:
+        assert vd.duty_end_min <= latest, (
+            f"{vd.vehicle_id}: 帰庫 {vd.duty_end_min}分。"
+            f"翌朝5:00までに休息期間11時間が空かない（限界 {latest}分）"
+        )
+
+
 def test_break_location_risk_detects_stranded_trip():
     """休憩を取る場所が無い便を検出できること。
 

@@ -259,6 +259,20 @@ def replan(
     frozen_trips = tuple(t for ts in frozen_by_vehicle.values() for t in ts)
     served_frozen = {st.customer_id for t in frozen_trips for st in t.stops}
 
+    # **積込済みの便が実際に降ろす量**を油種ごとに数える。
+    #
+    # 1軒の1日ぶんが1台に載らない大型店は、2〜3回に分けて届ける（実務）。
+    # その**1回目だけが積込済み**という状態は普通に起きる。以前はここで
+    # 「その先の1日ぶんが全部届いた」ことにしていたので、**残りの回が需要ごと
+    # 消えていた**（朝26.0kLの予定が、組み直すと12.0kLになって報告も出ない。
+    # 2026-09-20 発見）。
+    frozen_delivered: dict[str, dict[Product, int]] = {}
+    for t in frozen_trips:
+        for st in t.stops:
+            d = frozen_delivered.setdefault(st.customer_id, {})
+            for p, v in st.delivered_by_product:
+                d[p] = d.get(p, 0) + v
+
     # --- 2. 需要家: 午前に降ろした先は済み、新しい発注を足す ---------------
     new_by_customer: dict[str, dict[Product, int]] = {}
     for o in orders:
@@ -280,7 +294,8 @@ def replan(
     for c in scenario.customers:
         c2 = c
         if c.id in served_frozen:
-            delivered = c.demand_by_product()
+            # **届いた量だけを在庫に足す。** 分けて届ける先は、残りの回がまだある
+            delivered = frozen_delivered.get(c.id, {})
             tanks = tuple(
                 replace(
                     t,
@@ -291,7 +306,16 @@ def replan(
                 )
                 for t in c.tanks
             )
-            c2 = replace(c, tanks=tanks, planned=(), orders=())
+            # 計画配送・発注も、届いたぶんだけ減らす（丸ごと消さない）
+            def _left(items: tuple[tuple[Product, int], ...]) -> tuple[tuple[Product, int], ...]:
+                out = []
+                for p, v in items:
+                    rest = v - delivered.get(p, 0)
+                    if rest > 0:
+                        out.append((p, rest))
+                return tuple(out)
+
+            c2 = replace(c, tanks=tanks, planned=_left(c.planned), orders=_left(c.orders))
         if c.id in events_by_customer:
             # 日中に分かった「見込みより売れた」。積込済みの便のぶんを差し引いた後に当てる
             c2 = replace(c2, tanks=sell_more(c2.tanks, events_by_customer[c.id]))
@@ -473,7 +497,26 @@ def replan(
             for st in t.stops:
                 new_assign[st.customer_id] = (vd.vehicle_id, offset + t.trip_index, st.arrive_min)
 
+    # **量でも突き合わせる。** 大型店は1日に2〜3回に分けて届けるので（実務）、
+    # 「どの車が行くか」だけを見ていると、**分けたうちの1回が落ちても気づかない**。
+    # 実際、朝26.0kLの予定が組み直しで12.0kLになっても、担当は変わらないので
+    # 何も報告されなかった（2026-09-20 に発見）。配車係が見て分かる形で出す。
+    def volumes(days, *, only_after: int | None = None) -> dict[str, int]:
+        out: dict[str, int] = {}
+        for vd in days:
+            for t in vd.trips:
+                if only_after is not None and t.load_start_min < only_after:
+                    continue
+                for st in t.stops:
+                    out[st.customer_id] = out.get(st.customer_id, 0) + st.delivered_l
+        return out
+
+    planned_l = volumes(base.vehicle_days, only_after=now_min)
+    new_l = volumes(sub_plan.vehicle_days)
+
     changes: list[str] = []
+    why = "余力の範囲で" if ample else "**余力を割り込むため**"
+    missed_ids = {u.customer_id for u in sub_plan.mandatory_missed}
     for cid, old_vid in baseline.items():
         c = by_id[cid]
         if cid in new_assign:
@@ -483,13 +526,28 @@ def replan(
                     f"{c.name}: {names.get(old_vid, old_vid)} → {names[vid]}"
                     f"の{trip + 1}便目（{minutes_to_hhmm(arrive)}着）に担当替え"
                 )
-        elif c.mandatory_basis == "planned":
-            # **計画配送をずらすのは逃げ道ではない**（在庫が切れない限り前後に
-            # 動かせる。実務・2026-09-16）。数えるのは欠品と、発注に応えられない日
-            why = "余力の範囲で" if ample else "**余力を割り込むため**"
-            changes.append(
-                f"{c.name}: 計画配送 {c.demand_l / 1000:.1f}kL を明日にずらす（{why}）"
-            )
+        # **今日運ぶ量が減ったら、必ず言う。**
+        #
+        # **計画配送をずらすのは逃げ道ではない**（在庫が切れない限り前後に
+        # 動かせる。実務・2026-09-16）。数えないのと、黙っているのは別である。
+        # 必須で落ちたもの（発注・欠品の直前）は unfilled で別に出るので、
+        # ここでは二重に言わない。
+        short = planned_l.get(cid, 0) - new_l.get(cid, 0)
+        if short <= 0:
+            continue
+        if cid in missed_ids and c.mandatory_basis != "planned":
+            # 発注・欠品の直前で落ちたものは unfilled で別に出る。二重に言わない
+            continue
+        kind = "計画配送" if c.mandatory_basis == "planned" else "今日の予定"
+        planned = planned_l.get(cid, 0)
+        whole = short >= planned
+        line = (
+            f"{c.name}: {kind} {planned / 1000:.1f}kL を明日にずらす"
+            if whole
+            else f"{c.name}: {kind} {planned / 1000:.1f}kL のうち "
+                 f"{short / 1000:.1f}kL を明日にずらす"
+        )
+        changes.append(f"{line}（{why}）")
 
     for o in orders:
         c = by_id[o.customer_id]

@@ -32,7 +32,7 @@ from __future__ import annotations
 import datetime
 import functools
 import random
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 
 from core.domain import (
     DROP_STEP_BY_PRODUCT,
@@ -70,6 +70,11 @@ MARIFU = Depot(
     # 積込は平均20分（実務）。積場は8レーンで8台まで同時に積める。
     load_min=20,
 )
+
+#: 二交代の日の油槽所。**夜勤が積めるように閉所を翌05:00まで延ばす。**
+#: **仮置**——麻里布の積場が夜間も開いているかは未確認。夜に積めないなら
+#: 夜勤は1便しか持てず、二交代そのものが成り立たない（§9の未確認に追記）。
+MARIFU_NIGHT = replace(MARIFU, close_min=hhmm_to_minutes("29:00"))
 
 
 # ---------------------------------------------------------------------------
@@ -185,6 +190,28 @@ PROFILES: dict[CustomerType, tuple[str, str]] = {
     CustomerType.CARRIER_DEPOT: ("05:00", "08:30"),
     CustomerType.SUBURBAN_GS: ("07:00", "19:00"),
 }
+
+# --- 二交代（docs/業務前提.md §5.2） ----------------------------------------
+#
+# **車と人は別の資源。** 1台を2人で回して24時間動かす。1人あたりの拘束は
+# 13時間（引継ぎを考慮した値）なので、勤務帯は次のように置く。24時を跨ぐ
+# 時刻は 25:00・29:00 のように1440を超える分で書く（domain.minutes_to_hhmm
+# がそのまま「翌日の時刻」として出す）。
+#
+#: 勤務帯。**仮置**——実務の交代時刻は未確認。13時間ずつで24時間を覆い、
+#: 引継ぎに1時間重ねた形にしてある。
+SHIFT_WINDOWS: dict[str, tuple[str, str]] = {
+    "day": ("04:00", "17:00"),     # 13時間
+    "night": ("16:00", "29:00"),   # 16:00〜翌05:00。13時間
+}
+
+#: 夜に降ろせる先の類型。**ここが二交代の成否を決める**（設備 → 体制の順。実務）。
+#: 元売は24時間営業SS向けに無人荷卸しを展開済み（§8）なので、24h SSだけを夜の
+#: 行き先とする。営業所（05:00〜08:30）や日中のSSは夜間に受けない。
+NIGHT_DELIVERABLE: frozenset[CustomerType] = frozenset({CustomerType.URBAN_GS_24H})
+
+#: 夜も受ける先の受入枠。**仮置**——無人荷卸しの消防法要件は未確認（§9）。
+NIGHT_PROFILE: tuple[str, str] = ("04:00", "29:00")
 
 #: **需要は「月間いくら売るSSか」から割り出す**（実務・2026-09-16）。
 #:
@@ -346,6 +373,23 @@ FLEET: tuple[tuple[str, str, VehicleClass, tuple[int, ...]], ...] = (
 )
 
 DRIVER_NAMES: tuple[str, ...] = ("乗務員A", "乗務員B", "乗務員C", "乗務員D", "乗務員E")
+
+
+def _driver_name(i: int) -> str:
+    """i番目の乗務員の名前。A〜Zで足りなくなったらAA・ABと続ける。
+
+    二交代では人数が台数の2倍になるので、5人ぶんの名簿では足りない。
+    """
+    if i < len(DRIVER_NAMES):
+        return DRIVER_NAMES[i]
+    letters = ""
+    k = i
+    while True:
+        letters = chr(ord("A") + k % 26) + letters
+        k = k // 26 - 1
+        if k < 0:
+            break
+    return f"乗務員{letters}"
 
 #: 類型ごとに、トレーラーが入れるか。**荷役条件のマスターに載っている情報**。
 #:
@@ -603,6 +647,7 @@ def generate(
     declined_customers: tuple[str, ...] = (),
     sold_more: tuple[SoldMore, ...] = (),
     fleet_size: int | None = None,
+    shifts: int = 1,
 ) -> Scenario:
     """1日ぶんの配車問題を作る。
 
@@ -649,13 +694,24 @@ def generate(
     for e in sold_more:
         events_by_customer.setdefault(e.customer_id, []).append(e)
 
+    if shifts not in (1, 2):
+        raise ValueError(f"交代は1か2（{shifts}）")
     rng = random.Random(seed)
-    n = (datetime.date.fromisoformat(date) - EPOCH).days
+    day = datetime.date.fromisoformat(date)
+    n = (day - EPOCH).days
     phases = _phases(season)
+
+    # **日曜は二交代を解除する**（実務・§5.2）。SSに休むところが多く配送量が
+    # 減るので、前もって分かっている周期として体制を組める。逼迫した日だけ
+    # 二交代にする、という当日の切り替えはできない（設備と人事が先に要る）。
+    two_shift = shifts == 2 and day.weekday() != 6
 
     customers = []
     for spec in ROSTER:
         window_open, window_close = PROFILES[spec.type]
+        if two_shift and spec.type in NIGHT_DELIVERABLE:
+            # 夜も受ける先。二交代の夜勤が行けるのはここだけ（設備 → 体制の順）
+            window_open, window_close = NIGHT_PROFILE
         op, open_today = _operating_day(n, CLOSED_ON_SUNDAY[spec.type])
         planned: tuple[tuple[Product, int], ...] = ()
         tomorrow_planned: tuple[tuple[Product, int], ...] = ()
@@ -743,13 +799,17 @@ def generate(
     count = len(FLEET) if fleet_size is None else fleet_size
     if count < 1:
         raise ValueError(f"台数は1台以上（{fleet_size}）")
+
+    # **台数（車）と人数（乗務員）は別に数える。** 二交代では1台に昼勤と夜勤の
+    # 2人が付くので、乗務員は台数の2倍になる（実務・§5.2）。
+    per_vehicle = 2 if two_shift else 1
     drivers = tuple(
         Driver(
             id=f"d{i + 1}",
-            name=DRIVER_NAMES[i] if i < len(DRIVER_NAMES) else f"乗務員{chr(ord('A') + i)}",
+            name=_driver_name(i),
             available=f"d{i + 1}" not in absent_drivers,
         )
-        for i in range(count)
+        for i in range(count * per_vehicle)
     )
 
     # **同型の車が隣り合うように並べる。** ソルバーの対称性つぶしは隣り合う
@@ -759,22 +819,42 @@ def generate(
     vehicles = []
     for i in range(count):
         _vid, _vname, vclass, comps = patterns[i]
-        vehicles.append(
-            Vehicle(
-                id=f"v{i + 1}",
-                name=f"{i + 1}号車（{VEHICLE_CLASS_JA[vclass]} {sum(comps) // 1000}kL）",
-                vehicle_class=vclass,
-                compartments_l=comps,
-                driver_id=f"d{i + 1}",
+        base = f"{i + 1}号車（{VEHICLE_CLASS_JA[vclass]} {sum(comps) // 1000}kL）"
+        if not two_shift:
+            vehicles.append(
+                Vehicle(
+                    id=f"v{i + 1}",
+                    name=base,
+                    vehicle_class=vclass,
+                    compartments_l=comps,
+                    driver_id=f"d{i + 1}",
+                )
             )
-        )
+            continue
+        # 二交代。**1台を勤務帯ごとの2行で表す**（同じ車・別の乗務員・重ならない
+        # 時間帯）。台数は Vehicle.physical で数える。
+        for k, shift in enumerate(("day", "night")):
+            lo, hi = SHIFT_WINDOWS[shift]
+            vehicles.append(
+                Vehicle(
+                    id=f"v{i + 1}{'ab'[k]}",
+                    name=f"{base}{'昼勤' if shift == 'day' else '夜勤'}",
+                    vehicle_class=vclass,
+                    compartments_l=comps,
+                    driver_id=f"d{i * 2 + k + 1}",
+                    round_the_clock=True,
+                    physical_id=f"v{i + 1}",
+                    shift=shift,
+                    duty_window_min=(hhmm_to_minutes(lo), hhmm_to_minutes(hi)),
+                )
+            )
     vehicles = tuple(vehicles)
 
     return Scenario(
         date=date,
         season=season,
         seed=seed,
-        depot=MARIFU,
+        depot=MARIFU_NIGHT if two_shift else MARIFU,
         customers=tuple(customers),
         vehicles=vehicles,
         drivers=drivers,

@@ -174,11 +174,23 @@ def test_order_that_does_not_fit_is_flagged_not_trimmed():
         if t.load_start_min < now for st in t.stops
     ]
     assert loaded, "積込済みの便が無い（この確認が成り立たない）"
-    target = loaded[-1].customer_id
-    c = next(x for x in s.customers if x.id == target)
-    product = max(c.tanks, key=lambda t: t.capacity_l).product
+    # **積込済みの便が降ろすぶんを引いた空き**が、発注量に足りない先を選ぶ。
+    # 1軒を2〜3回に分けて届ける先では、積込済みなのは1回目だけなので、
+    # 「1日ぶんが全部届く」で数えると空きを小さく見積もってしまう（2026-09-26 修正）。
+    by_id = {c.id: c for c in s.customers}
+    room_after: dict[tuple[str, object], int] = {}
+    for st in loaded:
+        c = by_id[st.customer_id]
+        coming = dict(st.delivered_by_product)
+        for t in c.tanks:
+            key = (c.id, t.product)
+            room_after[key] = min(
+                room_after.get(key, t.topup_l), max(0, t.topup_l - coming.get(t.product, 0))
+            )
+    (target, product), room = min(room_after.items(), key=lambda kv: kv[1])
+    order_l = room + 8_000      # どう詰めても入らない量を頼む
     r = replan(s, base, now_min=now,
-               orders=[NewOrder(target, product, 8_000, "fax", "FAX-TEST")])
+               orders=[NewOrder(target, product, order_l, "fax", "FAX-TEST")])
     assert r.shortfalls, "入らない発注を確認せずに通した"
     assert "確認" in r.shortfalls[0]
     visits = [st for vd in r.sub_plan.vehicle_days for t in vd.trips for st in t.stops
@@ -222,20 +234,50 @@ def test_replan_without_orders_keeps_the_morning_plan(seed, date, now):
     """
     from core.solver import SolveMode
 
+    from core.domain import COMPARTMENT_UNIT_L
+
     s = generate(seed=seed, date=date, season="winter")
     base = solve(s, matrix=build_matrix(s.depot, s.customers), mode=SolveMode.REPRODUCIBLE)
     r = replan(s, base, now_min=now, orders=[])
-    assert r.changes == ()
+    # **担当は動かない。** 得だからという理由で朝の割り当てを変えない
+    assert not [c for c in r.changes if "担当替え" in c], r.changes
     assert not r.escapes and not r.spot_called
+
+    # **量は槽の刻みの端数までしかずれない。**
+    #
+    # 1軒を2〜3回に分けて届ける先では、積込済みの回で降ろした量を差し引いた残りが
+    # 刻み（主要3油種は4kL）に満たないことがある。2kLだけの荷降ろしはしない（実務）
+    # ので、その端数は明日へ繰り越す。それ以上ずれたら、運ぶはずの量が消えている。
+    def volumes(days):
+        out: dict[str, int] = {}
+        for vd in days:
+            for t in vd.trips:
+                for st in t.stops:
+                    out[st.customer_id] = out.get(st.customer_id, 0) + st.delivered_l
+        return out
+
+    before, after = volumes(base.vehicle_days), volumes(r.vehicle_days)
+    for cid, v in before.items():
+        assert v - after.get(cid, 0) <= COMPARTMENT_UNIT_L, (
+            f"{cid}: 朝 {v}L → 組み直し {after.get(cid, 0)}L。"
+            "刻みの端数を超えて減っている"
+        )
     # **見るのは担当**（どの車のどの便に、どの先が入るか）と帰庫時刻。便の中を回る
     # 順番は、費用が同点なら入れ替わりうる（朝は再現モード、組み直しは実時間で
     # 打ち切るため、同点の崩し方が揃わない）。順番まで固定したいなら、組み直しにも
     # 決定的な打ち切りが要る——当日の要求には重すぎるので、ここでは担当で見る。
     def assignment(days):
         return {
-            vd.vehicle_id: (vd.duty_end_min,
-                            [sorted(st.customer_id for st in t.stops) for t in vd.trips])
+            vd.vehicle_id: [sorted(st.customer_id for st in t.stops) for t in vd.trips]
             for vd in days
         }
 
     assert assignment(base.vehicle_days) == assignment(r.vehicle_days)
+
+    # 帰庫時刻も見る。**休憩が1時間抜ける**類の壊れ方はここに出る（過去に2度あった）。
+    # 刻みの端数を明日へ回すと荷卸しがそのぶん短くなるので、数分のずれは許す。
+    ends = {vd.vehicle_id: vd.duty_end_min for vd in r.vehicle_days}
+    for vd in base.vehicle_days:
+        assert abs(ends[vd.vehicle_id] - vd.duty_end_min) <= 15, (
+            f"{vd.vehicle_id}: 帰庫 {vd.duty_end_min}分 → {ends[vd.vehicle_id]}分"
+        )

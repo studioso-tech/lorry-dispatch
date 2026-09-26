@@ -63,6 +63,8 @@ from core.domain import (
     MAX_DROP_RIGID_L,
     MAX_DROP_TRAILER_L,
     DAY_SHIFT_DEPART_MIN,
+    MINUTES_PER_DAY,
+    REST_PERIOD_MIN,
     LABOR_BREAK_45_MIN,
     LABOR_BREAK_60_MIN,
     LABOR_BREAK_DUTY_45_MIN,
@@ -129,9 +131,45 @@ DUTY_COST_PER_MIN = 1
 #: 朝の計画から担当の車を変えたときの罰（分換算）。**仮置。**
 #:
 #: 乗務員はもう朝の計画を聞いて動いている。担当を入れ替えると連絡と積み荷の
-#: 組み替えの手間がかかり、現場は混乱する。「1軒の担当を変えるのは、1時間の
-#: 遠回りに相当する手間」とした。当日の組み直しでだけ効く。
-STABILITY_PENALTY_MIN = 60
+#: 組み替えの手間がかかり、現場は混乱する。当日の組み直しでだけ効く。
+#:
+#: **非専属を呼ぶ費用（240分）のすぐ手前**に置く。この順序が要点で:
+#:
+#:     担当替え1軒（200） ＜ 非専属を1台呼ぶ（240） ＜ 担当替え2軒（400）
+#:
+#: 専属の余りで入るなら非専属は呼ばない（実務）が、朝の計画を大きく崩すくらい
+#: なら非専属を呼ぶ。
+#:
+#: 以前は60分（「1時間の遠回りに相当する手間」）だった。それだと**差し込みが
+#: 1件も無いのに担当が入れ替わる**ことが起きる。朝の計画は探索の打ち切りで
+#: 最適とは限らず、組み直しのほうが良い解を見つけると、得だからという理由だけで
+#: 入れ替わってしまう。配車係はそんな理由で朝の割り当てを変えない。
+STABILITY_PENALTY_MIN = 200
+
+#: **朝の計画で今日行くと決めた先を、今日やめたときの罰**（分換算）。
+#: 組み直しでだけ効く（朝の計画を組むときは baseline が無いので効かない）。
+#:
+#: **朝の約束は、物理的に無理なときだけ崩す。** 計画配送は在庫が切れない限り
+#: 前後に動かせる（実務）が、**動かせることと、得だから動かすことは別**である。
+#: 朝の計画は乗務員にもSSにも伝わっている。
+#:
+#: 走行が浮くという理由で崩れないよう、**必須の罰と同じ桁**に置く。便を1つ
+#: 落とすと走行と拘束がまとめて浮くので（実測で500分前後）、数百分の罰では
+#: 足りず、差し込みが1件も無い組み直しで配送が消えていた（2026-09-20 に発見）。
+#: 240 → 480 と上げても消える日が残ったので、水準ではなく**順序**で決める:
+#:
+#:     発注を落とす（2M） ＞ 朝の約束を落とす（M〜1.5M） ＞ 非専属を呼ぶ（240分）
+#:
+#: この順序から:
+#:
+#:   - 発注に応えられないくらいなら、計画配送を明日へずらす（実務）
+#:   - **余力が細いときは、ずらすより費用を払って非専属を呼ぶ**（実務）。
+#:     余力があるときは非専属が候補から外れる（core/replan.py）ので、
+#:     この罰が効くのは「本当に今日は運べない」ときだけになる
+#:
+#: 罰は**必須の罰の半分**に置く。同じにすると「朝の約束を落とす」と
+#: 「発注を落とす」が同点になり、発注が落ちる日が出る。
+BASELINE_DROP_PENALTY_MIN = PENALTY_MANDATORY_MIN // 2
 
 #: 非専属を1台呼ぶ費用（分換算）。**仮置。** 専属より2〜3割高い単価の1日ぶんの
 #: 割増（13時間×25% ≒ 195分）に呼び出しの手間を足した水準。専属の余りで
@@ -251,6 +289,11 @@ class Stop:
     delivered_l: int
     window_open_min: int
     window_close_min: int
+    #: 油種ごとの降ろす量（L）。**1軒を2〜3回に分けて届けるとき、この立ち寄りが
+    #: どの油種を何L置くのかは合計では分からない。** 当日の組み直しが「積込済みの
+    #: 便で何が届いたか」を数えるのに要る（分けたうちの1回だけが積込済み、という
+    #: 状態が普通に起きる）。
+    delivered_by_product: tuple[tuple[Product, int], ...] = ()
 
     @property
     def slack_min(self) -> int:
@@ -608,7 +651,12 @@ def solve(
     R = max_trips
     N = R + C                    # 0..R-1 が油槽所の複製、R.. が需要家
     travel = matrix.minutes
-    horizon = depot.close_min
+    # 地平は油槽所の閉所まで。**二交代の夜勤は24時を跨ぐ**ので、勤務帯の
+    # 終わり（1440超）まで伸ばす（docs/業務前提.md §5.2）。
+    horizon = max(
+        [depot.close_min]
+        + [v.duty_window_min[1] for v in fleet if v.duty_window_min is not None]
+    )
     load_min = depot.load_min
 
     def mat(node: int) -> int:
@@ -705,10 +753,41 @@ def solve(
     # 当日の組み直しでは、午前の便から戻る時刻（Vehicle.available_from_min）。
     # 日勤の車は5:00より前には車庫を出ない（通勤の混雑を避けるため。実務）。
     def start_of(veh: Vehicle) -> int:
-        earliest = depot.open_min if veh.round_the_clock else max(depot.open_min, DAY_SHIFT_DEPART_MIN)
+        if veh.duty_window_min is not None:
+            # 二交代。勤務帯の始まりより前には動かない（夜勤は油槽所の開所より後）
+            earliest = veh.duty_window_min[0]
+        elif veh.round_the_clock:
+            earliest = depot.open_min
+        else:
+            earliest = max(depot.open_min, DAY_SHIFT_DEPART_MIN)
         if veh.available_from_min is None:
             return earliest
         return max(earliest, veh.available_from_min)
+
+    def shift_start_of(veh: Vehicle) -> int:
+        """その乗務員が**毎日**出る時刻（途中から解くときの状態を見ない）。
+
+        休息期間は「明日の同じ勤務帯の始まり」までの間隔なので、今日たまたま
+        遅く動き出したこと（available_from_min）は関係しない。
+        """
+        if veh.duty_window_min is not None:
+            return veh.duty_window_min[0]
+        if veh.round_the_clock:
+            return depot.open_min
+        return max(depot.open_min, DAY_SHIFT_DEPART_MIN)
+
+    def end_of(veh: Vehicle) -> int:
+        """その車の拘束を収める終わり。
+
+        二交代なら勤務帯の終わり。そうでなければ、**休息期間（継続11時間）が
+        翌日の出発までに入る**ところまで（改善基準告示）。拘束13時間だけを
+        見ていると、遅く出て遅く帰る計画が通り、翌朝5:00に出られない車ができる。
+        1日ずつ解いているとその矛盾は見えない。
+        """
+        limit = shift_start_of(veh) + MINUTES_PER_DAY - REST_PERIOD_MIN
+        if veh.duty_window_min is not None:
+            return min(veh.duty_window_min[1], limit)
+        return min(horizon, limit)
 
     # 時刻。油槽所の複製は「その便の出発時刻」、需要家は「到着時刻」。
     t = [
@@ -722,7 +801,9 @@ def solve(
         ]
         for v in range(V)
     ]
-    duty_end = [model.NewIntVar(0, horizon, f"dutyend_v{v}") for v in range(V)]
+    # 帰庫は勤務帯の終わりまで。二交代では昼勤と夜勤で違う（重ならないので、
+    # 同じ車が2か所に居ることにはならない）。
+    duty_end = [model.NewIntVar(0, end_of(fleet[v]), f"dutyend_v{v}") for v in range(V)]
 
     # --- 周回（1台につき1本） ----------------------------------------------
     pruned = 0
@@ -801,6 +882,8 @@ def solve(
             and (a.spot, a.available_from_min, a.duty_origin_min, a.driven_min, a.worked_min)
             == (b.spot, b.available_from_min, b.duty_origin_min, b.driven_min, b.worked_min)
             and a.vehicle_class == b.vehicle_class
+            # 二交代では昼勤と夜勤は入れ替えられない（走れる時間が違う）
+            and (a.shift, a.duty_window_min) == (b.shift, b.duty_window_min)
         )
 
     symmetric_pairs = 0
@@ -1061,7 +1144,8 @@ def solve(
         if p:
             penalties.append(p * (1 - served[c_idx]))
 
-    # 朝の計画から担当を変えた罰（当日の組み直しでだけ効く）。
+    # 朝の計画から担当を変えた罰と、朝の計画で今日行くと決めた先を今日やめた罰
+    # （どちらも当日の組み直しでだけ効く）。
     changes = []
     if baseline:
         vid_index = {veh.id: v for v, veh in enumerate(fleet)}
@@ -1075,6 +1159,10 @@ def solve(
                 for v in range(V)
                 if v != vid_index[b]
             )
+            # **今日行くと決めた先を今日やめるのは、担当替えより重い。**
+            # 1軒を2回に分けて届ける先では、分けたうちの1回にも効く
+            # （落ちても担当は変わらないので、罰が無いと黙って消える）。
+            changes.append(BASELINE_DROP_PENALTY_MIN * (1 - served[c_idx]))
 
     # **すでに発生した拘束は費用に数えない。** 組み直しでは、午前の便で拘束が
     # 始まった車の「朝から空くまで」は、午後に使っても使わなくても払っている。
@@ -1276,6 +1364,7 @@ def solve(
                     arrive_min=solver.Value(t[v][node]),
                     depart_min=solver.Value(t[v][node]) + cust(node).service_min,
                     delivered_l=cust(node).demand_l,
+                    delivered_by_product=tuple(cust(node).demand_by_product().items()),
                     window_open_min=cust(node).window_open_min,
                     window_close_min=cust(node).window_close_min,
                 )
