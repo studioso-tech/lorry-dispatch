@@ -15,3 +15,8 @@ venv/
 data/*.json
 !data/.gitkeep
 .scratch/
+
+# デモ動画の完成品（YouTubeに置く。リポジトリには入れない）
+media/*.mp4
+media/work/
+media/narration/

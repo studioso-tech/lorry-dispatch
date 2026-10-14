@@ -1,0 +1,46 @@
+<!doctype html>
+<html lang="ja">
+<head>
+<meta charset="utf-8">
+<title>デモ動画のカード</title>
+<style>
+  /* 画面と同じ地味さでそろえる。動画の中で浮かないようにするため。 */
+  body { margin: 0; font: 16px/1.7 "Yu Gothic", "Hiragino Kaku Gothic ProN", Meiryo, sans-serif;
+         color: #1b1b1b; background: #f7f8fa; }
+  .card { width: 1920px; height: 1080px; box-sizing: border-box; padding: 110px 150px;
+          background: #fff; display: flex; flex-direction: column; justify-content: center; }
+  h1 { font-size: 54px; margin: 0 0 10px; }
+  .lead { color: #5d6470; font-size: 26px; margin: 0 0 50px; }
+  table { border-collapse: collapse; font-size: 34px; width: 100%; }
+  th, td { text-align: left; padding: 20px 26px; border-bottom: 2px solid #e3e7ec; }
+  th { color: #5d6470; font-weight: 400; font-size: 26px; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  strong { color: #14508c; }
+  .note { margin-top: 46px; color: #5d6470; font-size: 24px; }
+  .arch { padding: 60px; background: #fff; }
+  .arch img { width: 100%; height: auto; }
+</style>
+</head>
+<body>
+
+<!-- 幕4後半: 半期の体制設計 -->
+<div class="card" id="fleet">
+  <h1>半期に、専属を何台取るか</h1>
+  <p class="lead">冬の半期・4エリア。台数は需要から出る答えで、入力ではない。</p>
+  <table>
+    <tr><th></th><th>専属</th><th>待機の非専属</th><th>応えられない日</th></tr>
+    <tr><td>エリア間で融通しない</td><td class="num"><strong>15台</strong></td>
+        <td class="num"><strong>2台</strong></td><td class="num">1日 / 42日</td></tr>
+    <tr><td>完全に融通した場合</td><td class="num"><strong>10台</strong></td>
+        <td class="num"><strong>1台</strong></td><td class="num">13日 / 42日</td></tr>
+  </table>
+  <p class="note">数えるのは欠品と、発注に応えられないこと。計画配送を明日へ回すのは数えない。</p>
+</div>
+
+<!-- 締め: 構成図 -->
+<div class="card arch" id="arch">
+  <img src="../docs/images/architecture.png" alt="構成図">
+</div>
+
+</body>
+</html>
